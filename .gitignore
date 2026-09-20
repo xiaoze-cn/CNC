@@ -1,0 +1,8 @@
+.pixi/
+__pycache__/
+*.py[cod]
+
+# Generated inspection and tuning runs are local working data, not source.
+data/inspect/
+data/tuning/
+data/calibrate/
