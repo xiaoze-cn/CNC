@@ -18,18 +18,18 @@ import numpy as np
 
 from inspection.geometry.pointcloud import (
     clean_points,
-    turntable_overlap_metrics,
+    turntable_overlap,
     voxel_downsample,
-    write_ascii_ply,
+    write_ply,
 )
-from inspection.geometry.transforms import to_turntable_coordinates
+from inspection.geometry.transforms import to_turntable
 
 from .evidence import (
-    apply_spatial_component_evidence,
+    apply_evidence,
     neighbor_visibility,
     normalized_rows,
 )
-from .observations import FrameObservation, load_frame_observations
+from .observations import FrameObservation, load_observations
 
 
 CPU_WORKERS = max(2, min(4, os.cpu_count() or 2))
@@ -42,24 +42,26 @@ class PointCloudProcessingConfig:
     voxel_size_mm: float = 0.05
     angle_sign: float = -1.0
     support_radius_mm: float = 0.15
-    min_views: int = 3
-    min_support_angle_degrees: float = 0.0
-    max_support_angle_degrees: float | None = None
-    min_normal_consistency_cosine: float | None = 0.60
-    require_same_observation_side: bool = True
+    consensus_mm: float = 0.05
+    consensus_views: int = 3
+    min_views: int | None = None
+    min_angle: float = 0.0
+    max_angle: float | None = None
+    min_consistency: float | None = 0.60
+    require_side: bool = True
     use_occlusion_visibility: bool = True
     occlusion_tolerance_mm: float = 0.50
     occlusion_min_neighbors: int = 1
-    overlap_voxel_size_mm: float = 1.0
+    overlap_voxel: float = 1.0
     voxel_representative: str = "medoid"
     confidence_min: float | None = 0.40
     edge_uncertain_px: float = 1.0
     image_gradient_threshold: float = 32.0
-    depth_gradient_threshold_mm: float = 0.50
+    depth_gradient: float = 0.50
     normal_change_cosine: float = 0.85
     confidence_drop_ratio: float = 0.75
     confidence_drop_abs: float = 0.10
-    edge_policy: str = "hard"
+    edge_policy: str = "soft"
     min_incidence_cosine: float | None = None
     component_radius_mm: float = 0.30
     min_component_ratio: float = 0.005
@@ -73,8 +75,8 @@ class PointCloudProcessingConfig:
     ) -> "PointCloudProcessingConfig":
         """Return the released profile used by formal scans.
 
-        Edge evidence is hard by default for conservative formal measurement.
-        The soft policy remains available for offline investigation.
+        Edge observations require independent support from a non-edge target.
+        Unsupported edge observations remain uncertain instead of being deleted.
         """
 
         return cls(voxel_size_mm=voxel_size_mm, angle_sign=angle_sign)
@@ -86,35 +88,41 @@ class PointCloudProcessingConfig:
             raise ValueError("angle_sign must be non-zero")
         if self.support_radius_mm <= 0:
             raise ValueError("support_radius_mm must be positive")
-        if self.min_views < 1:
+        if self.consensus_mm <= 0:
+            raise ValueError("consensus_mm must be positive")
+        if self.consensus_mm > self.support_radius_mm:
+            raise ValueError("consensus_mm cannot exceed support_radius_mm")
+        if self.consensus_views < 2:
+            raise ValueError("consensus_views must be at least 2")
+        if self.min_views is not None and self.min_views < 1:
             raise ValueError("min_views must be at least 1")
-        if not 0 <= self.min_support_angle_degrees <= 180:
-            raise ValueError("min_support_angle_degrees must be in [0, 180]")
+        if not 0 <= self.min_angle <= 180:
+            raise ValueError("min_angle must be in [0, 180]")
         if (
-            self.max_support_angle_degrees is not None
-            and not 0 < self.max_support_angle_degrees <= 180
+            self.max_angle is not None
+            and not 0 < self.max_angle <= 180
         ):
             raise ValueError(
-                "max_support_angle_degrees must be in (0, 180] when provided"
+                "max_angle must be in (0, 180] when provided"
             )
         if (
-            self.max_support_angle_degrees is not None
-            and self.min_support_angle_degrees > self.max_support_angle_degrees
+            self.max_angle is not None
+            and self.min_angle > self.max_angle
         ):
             raise ValueError(
-                "min_support_angle_degrees cannot exceed max_support_angle_degrees"
+                "min_angle cannot exceed max_angle"
             )
         if (
-            self.min_normal_consistency_cosine is not None
-            and not 0 <= self.min_normal_consistency_cosine <= 1
+            self.min_consistency is not None
+            and not 0 <= self.min_consistency <= 1
         ):
-            raise ValueError("min_normal_consistency_cosine must be in [0, 1]")
+            raise ValueError("min_consistency must be in [0, 1]")
         if self.occlusion_tolerance_mm < 0:
             raise ValueError("occlusion_tolerance_mm must be non-negative")
         if self.occlusion_min_neighbors < 1 or self.occlusion_min_neighbors > 9:
             raise ValueError("occlusion_min_neighbors must be in [1, 9]")
-        if self.overlap_voxel_size_mm <= 0:
-            raise ValueError("overlap_voxel_size_mm must be positive")
+        if self.overlap_voxel <= 0:
+            raise ValueError("overlap_voxel must be positive")
         if self.voxel_representative not in {"medoid", "centroid"}:
             raise ValueError("voxel_representative must be medoid or centroid")
         if self.confidence_min is not None and not np.isfinite(self.confidence_min):
@@ -123,8 +131,8 @@ class PointCloudProcessingConfig:
             raise ValueError("edge_uncertain_px must be non-negative")
         if self.image_gradient_threshold < 0:
             raise ValueError("image_gradient_threshold must be non-negative")
-        if self.depth_gradient_threshold_mm < 0:
-            raise ValueError("depth_gradient_threshold_mm must be non-negative")
+        if self.depth_gradient < 0:
+            raise ValueError("depth_gradient must be non-negative")
         if not 0 <= self.normal_change_cosine <= 1:
             raise ValueError("normal_change_cosine must be in [0, 1]")
         if not 0 < self.confidence_drop_ratio <= 1:
@@ -158,6 +166,18 @@ class PointCloudProcessingResult:
     likely_noise_points: np.ndarray = field(
         default_factory=lambda: np.empty((0, 3), dtype=np.float32)
     )
+    trusted_points: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    candidate_cloud: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    conflict_points: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    single_points: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,33 +202,190 @@ class MultiviewEvidenceSelection:
     )
     occluded_view_tests: int = 0
     normal_rejected_matches: int = 0
-    opposite_side_rejected_matches: int = 0
+    side_rejected: int = 0
     image_gradient_candidates: int = 0
     depth_gradient_candidates: int = 0
     normal_change_candidates: int = 0
     confidence_drop_candidates: int = 0
-    soft_edge_supported_candidates: int = 0
+    edge_supported: int = 0
     compute_device_name: str = "cpu"
-    effective_max_support_angle_degrees: float | None = None
+    max_angle: float | None = None
+    effective_min_views: int | None = None
+    min_angle: float | None = None
+    view_evidence_mode: str = "fixed"
+    view_step: float | None = None
+    view_gap: float | None = None
+    complete_evidence: bool = False
+    edge_rejected: int = 0
+    invalid_excluded: int = 0
+    edge_excluded: int = 0
+    trusted_points: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    candidate_cloud: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    conflict_points: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    single_points: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
 
 
-def _effective_max_support_angle(
+@dataclass(frozen=True, slots=True)
+class _ViewEvidencePolicy:
+    min_views: int
+    min_angle: float
+    mode: str
+    view_step: float | None
+    view_gap: float | None
+    complete_evidence: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _EligibleNeighborSearch:
+    search: object | None
+    source_indices: np.ndarray
+
+
+def _support_mask(
+    hard_sensor_mask: np.ndarray,
+    edge_mask: np.ndarray,
+    edge_policy: str,
+) -> np.ndarray:
+    """Select points allowed to provide independent cross-view support."""
+
+    eligible = np.asarray(hard_sensor_mask, dtype=bool).copy()
+    if edge_policy != "off":
+        eligible &= ~np.asarray(edge_mask, dtype=bool)
+    return eligible
+
+
+def _complete_evidence(
+    observation: FrameObservation | None,
+    point_count: int,
+) -> bool:
+    """Check whether a frame can justify the sparse-view metrology policy."""
+
+    if observation is None or observation.angle_degrees is None:
+        return False
+    point_fields = (
+        observation.source_indices,
+        observation.confidence,
+        observation.incidence_cosine,
+        observation.normals,
+    )
+    if any(value is None or len(value) != point_count for value in point_fields):
+        return False
+    if (
+        observation.image is None
+        or observation.depth_mm is None
+        or observation.intrinsics is None
+        or observation.camera_origin is None
+    ):
+        return False
+    grid_shape = _grid_shape(observation)
+    if grid_shape is None:
+        return False
+    indices = np.asarray(observation.source_indices).reshape(-1)
+    return bool(
+        np.isfinite(indices).all()
+        and np.all(indices >= 0)
+        and np.all(indices < grid_shape[0] * grid_shape[1])
+    )
+
+
+def _resolve_policy(
+    config: PointCloudProcessingConfig,
+    observations: Sequence[FrameObservation | None],
+    point_counts: Sequence[int],
+    frame_angles_degrees: Sequence[float | None],
+) -> _ViewEvidencePolicy:
+    """Balance redundancy against angular sampling without weakening geometry gates."""
+
+    complete_evidence = (
+        bool(observations)
+        and len(observations) == len(point_counts) == len(frame_angles_degrees)
+        and all(
+        _complete_evidence(observation, point_count)
+        for observation, point_count in zip(observations, point_counts)
+        )
+    )
+    median_step: float | None = None
+    maximum_gap: float | None = None
+    regular_full_circle = False
+    if frame_angles_degrees and all(
+        angle is not None and np.isfinite(angle) for angle in frame_angles_degrees
+    ):
+        angles = np.sort(
+            np.mod(np.asarray(frame_angles_degrees, dtype=np.float64), 360.0)
+        )
+        gaps = np.diff(np.r_[angles, angles[0] + 360.0])
+        median_step = float(np.median(gaps))
+        maximum_gap = float(np.max(gaps))
+        minimum_gap = float(np.min(gaps))
+        regular_full_circle = bool(
+            len(angles) >= 6
+            and median_step > 0
+            and minimum_gap >= median_step * 0.75
+            and maximum_gap <= max(median_step * 1.25, median_step + 5.0)
+        )
+
+    min_angle = config.min_angle
+    if median_step is not None:
+        min_angle = max(min_angle, median_step * 0.5)
+
+    if config.min_views is not None:
+        return _ViewEvidencePolicy(
+            min_views=config.min_views,
+            min_angle=config.min_angle,
+            mode="fixed",
+            view_step=median_step,
+            view_gap=maximum_gap,
+            complete_evidence=complete_evidence,
+        )
+
+    sparse_metrology = bool(
+        complete_evidence
+        and regular_full_circle
+        and median_step is not None
+        and 30.0 < median_step <= 65.0
+    )
+    return _ViewEvidencePolicy(
+        min_views=2 if sparse_metrology else 3,
+        min_angle=min_angle,
+        mode=(
+            "adaptive_sparse_metrology"
+            if sparse_metrology
+            else "adaptive_dense"
+            if median_step is not None and median_step <= 30.0
+            else "adaptive_conservative"
+        ),
+        view_step=median_step,
+        view_gap=maximum_gap,
+        complete_evidence=complete_evidence,
+    )
+
+
+def _support_angle(
     config: PointCloudProcessingConfig,
     frame_angles_degrees: Sequence[float | None],
+    min_views: int,
 ) -> float:
     """Derive the smallest window that gives every frame enough support views."""
 
-    configured = config.max_support_angle_degrees
-    required_support = config.min_views - 1
+    configured = config.max_angle
+    required_support = min_views - 1
     if configured is not None:
         return configured
     if required_support <= 0:
         return 180.0
     if any(angle is None for angle in frame_angles_degrees):
         raise ValueError("自动视角证据匹配要求每个非空帧都包含采集角度")
-    if len(frame_angles_degrees) < config.min_views:
+    if len(frame_angles_degrees) < min_views:
         raise ValueError(
-            f"正式测量至少需要 {config.min_views} 个非空采集帧，"
+            f"正式测量至少需要 {min_views} 个非空采集帧，"
             f"当前只有 {len(frame_angles_degrees)} 个"
         )
 
@@ -225,7 +402,7 @@ def _effective_max_support_angle(
     return max(required_angles)
 
 
-def _observation_grid_shape(observation: FrameObservation) -> tuple[int, int] | None:
+def _grid_shape(observation: FrameObservation) -> tuple[int, int] | None:
     """Return the source sensor grid shape used by point indices, when available."""
 
     for value in (observation.image, observation.depth_mm):
@@ -239,7 +416,7 @@ def _observation_grid_shape(observation: FrameObservation) -> tuple[int, int] | 
     return None
 
 
-def _scatter_source_values(
+def _scatter_values(
     values: np.ndarray,
     indices: np.ndarray,
     size: int,
@@ -252,7 +429,7 @@ def _scatter_source_values(
     return result
 
 
-def _neighbor_difference_edges(values: np.ndarray, threshold: float) -> np.ndarray:
+def _difference_edges(values: np.ndarray, threshold: float) -> np.ndarray:
     """Mark pixels whose 4-connected neighbor differs by more than a threshold."""
 
     grid = np.asarray(values, dtype=np.float32)
@@ -279,7 +456,7 @@ def _neighbor_difference_edges(values: np.ndarray, threshold: float) -> np.ndarr
     return edges
 
 
-def _normal_change_edges(
+def _normal_edges(
     normals: np.ndarray,
     threshold: float,
 ) -> np.ndarray:
@@ -305,7 +482,7 @@ def _normal_change_edges(
     return edges
 
 
-def _confidence_drop_edges(confidence: np.ndarray, ratio: float, absolute: float) -> np.ndarray:
+def _confidence_edges(confidence: np.ndarray, ratio: float, absolute: float) -> np.ndarray:
     """Mark confidence values that fall sharply below their local 4-neighbor level."""
 
     grid = np.asarray(confidence, dtype=np.float32)
@@ -353,7 +530,7 @@ def _edge_evidence(
     if observation.source_indices is None or len(observation.source_indices) != point_count:
         return combined, counts
     indices = np.asarray(observation.source_indices, dtype=np.int64).reshape(-1)
-    grid_shape = _observation_grid_shape(observation)
+    grid_shape = _grid_shape(observation)
     if grid_shape is None:
         return combined, counts
     grid_size = grid_shape[0] * grid_shape[1]
@@ -398,9 +575,9 @@ def _edge_evidence(
     if observation.depth_mm is not None:
         depth = np.asarray(observation.depth_mm, dtype=np.float32)
         if depth.ndim == 2 and depth.shape[:2] == grid_shape:
-            if config.depth_gradient_threshold_mm > 0:
-                evidence["depth_gradient_candidates"] = _neighbor_difference_edges(
-                    depth, config.depth_gradient_threshold_mm
+            if config.depth_gradient > 0:
+                evidence["depth_gradient_candidates"] = _difference_edges(
+                    depth, config.depth_gradient
                 ).reshape(-1)[safe_indices]
 
     if observation.normals is not None:
@@ -408,15 +585,15 @@ def _edge_evidence(
         if len(normals) == point_count:
             normal_grid = np.full((grid_size, 3), np.nan, dtype=np.float32)
             normal_grid[indices[source_valid]] = normals[source_valid]
-            evidence["normal_change_candidates"] = _normal_change_edges(
+            evidence["normal_change_candidates"] = _normal_edges(
                 normal_grid.reshape(*grid_shape, 3), config.normal_change_cosine
             ).reshape(-1)[safe_indices]
 
     if observation.confidence is not None:
         confidence = np.asarray(observation.confidence, dtype=np.float32).reshape(-1)
         if len(confidence) == point_count:
-            confidence_grid = _scatter_source_values(confidence, indices, grid_size)
-            evidence["confidence_drop_candidates"] = _confidence_drop_edges(
+            confidence_grid = _scatter_values(confidence, indices, grid_size)
+            evidence["confidence_drop_candidates"] = _confidence_edges(
                 confidence_grid.reshape(grid_shape),
                 config.confidence_drop_ratio,
                 config.confidence_drop_abs,
@@ -431,7 +608,7 @@ def _edge_evidence(
 
 
 @lru_cache(maxsize=1)
-def _cuda_runtime_probe() -> bool:
+def _cuda_probe() -> bool:
     """Check a CUDA kernel in a child process so a broken driver cannot hang us."""
 
     probe = (
@@ -455,7 +632,7 @@ def _cuda_runtime_probe() -> bool:
     return True
 
 
-def _resolve_compute_device(*, prefer_gpu: bool = False) -> tuple[object, str]:
+def _compute_device(*, prefer_gpu: bool = False) -> tuple[object, str]:
     """Keep the CUDA path available while defaulting formal processing to CPU."""
 
     import open3d as o3d
@@ -468,12 +645,12 @@ def _resolve_compute_device(*, prefer_gpu: bool = False) -> tuple[object, str]:
         cuda_available &= o3d.core.cuda.device_count() > 0
     except Exception:
         cuda_available = False
-    if cuda_available and _cuda_runtime_probe():
+    if cuda_available and _cuda_probe():
         return o3d.core.Device("CUDA:0"), "cuda"
     return o3d.core.Device("CPU:0"), "cpu"
 
 
-def multiview_evidence_processor(
+def process_evidence(
     frames: Sequence[np.ndarray],
     config: PointCloudProcessingConfig,
     *,
@@ -487,6 +664,7 @@ def multiview_evidence_processor(
     separate artifact for review instead of being silently discarded.
     """
 
+    config.validate()
     # 保留所有有限观测用于证据判断
     # 体素降采样只在支持分类后进行因此不会改变真实观测是否获得支持
     clouds: list[np.ndarray] = []
@@ -580,9 +758,15 @@ def multiview_evidence_processor(
             normal_change_candidates=normal_change_candidates,
             confidence_drop_candidates=confidence_drop_candidates,
         )
-    if config.min_views > len(clouds):
+    evidence_policy = _resolve_policy(
+        config,
+        cloud_observations,
+        [len(cloud) for cloud in clouds],
+        frame_angles_degrees,
+    )
+    if evidence_policy.min_views > len(clouds):
         raise ValueError("min_views must be between 1 and the number of non-empty frames")
-    if config.min_views == 1 or len(clouds) == 1:
+    if evidence_policy.min_views == 1 or len(clouds) == 1:
         formal_masks = (
             [hard & ~edge for hard, edge in zip(hard_sensor_masks, edge_masks)]
             if config.edge_policy == "soft"
@@ -602,7 +786,7 @@ def multiview_evidence_processor(
             config.voxel_size_mm,
             representative=config.voxel_representative,
         )
-        valid_points, uncertain_points, components = apply_spatial_component_evidence(
+        valid_points, uncertain_points, components = apply_evidence(
             all_points, uncertain_points, config
         )
         return MultiviewEvidenceSelection(
@@ -622,20 +806,47 @@ def multiview_evidence_processor(
             depth_gradient_candidates=depth_gradient_candidates,
             normal_change_candidates=normal_change_candidates,
             confidence_drop_candidates=confidence_drop_candidates,
+            effective_min_views=evidence_policy.min_views,
+            min_angle=evidence_policy.min_angle,
+            view_evidence_mode=evidence_policy.mode,
+            view_step=evidence_policy.view_step,
+            view_gap=evidence_policy.view_gap,
+            complete_evidence=evidence_policy.complete_evidence,
+            single_points=all_points,
         )
 
     import open3d as o3d
-    compute_device, device_name = _resolve_compute_device(prefer_gpu=prefer_gpu)
+    compute_device, device_name = _compute_device(prefer_gpu=prefer_gpu)
 
-    searches: list[object] = []
-    for cloud in clouds:
+    searches: list[_EligibleNeighborSearch] = []
+    invalid_excluded = 0
+    edge_excluded = 0
+    for cloud, hard_mask, edge_mask in zip(
+        clouds, hard_sensor_masks, edge_masks
+    ):
+        target_mask = _support_mask(
+            hard_mask,
+            edge_mask,
+            config.edge_policy,
+        )
+        target_indices = np.flatnonzero(target_mask).astype(np.int64, copy=False)
+        invalid_excluded += int(np.count_nonzero(~hard_mask))
+        if config.edge_policy != "off":
+            edge_excluded += int(
+                np.count_nonzero(hard_mask & edge_mask)
+            )
+        if not len(target_indices):
+            searches.append(_EligibleNeighborSearch(None, target_indices))
+            continue
         search = o3d.core.nns.NearestNeighborSearch(
             o3d.core.Tensor(
-                cloud, dtype=o3d.core.Dtype.Float32, device=compute_device
+                cloud[target_indices],
+                dtype=o3d.core.Dtype.Float32,
+                device=compute_device,
             )
         )
         search.knn_index()
-        searches.append(search)
+        searches.append(_EligibleNeighborSearch(search, target_indices))
     normalized_normals: list[tuple[np.ndarray, np.ndarray] | None] = []
     for cloud, observation in zip(clouds, cloud_observations):
         if observation is not None and observation.normals is not None:
@@ -645,13 +856,13 @@ def multiview_evidence_processor(
             )
         else:
             normalized_normals.append(None)
-    required_support = config.min_views - 1
+    required_support = evidence_policy.min_views - 1
     if (
         required_support > 0
         and (
-            config.min_support_angle_degrees > 0
-            or config.max_support_angle_degrees is None
-            or config.max_support_angle_degrees < 180
+            evidence_policy.min_angle > 0
+            or config.max_angle is None
+            or config.max_angle < 180
         )
     ) and any(
         angle is None for angle in frame_angles_degrees
@@ -659,19 +870,24 @@ def multiview_evidence_processor(
         raise ValueError(
             "视角证据门槛要求每个非空帧都包含采集角度"
         )
-    effective_max_support_angle = _effective_max_support_angle(
-        config, frame_angles_degrees
+    max_angle = _support_angle(
+        config, frame_angles_degrees, evidence_policy.min_views
     )
     valid_parts: list[np.ndarray] = []
     uncertain_parts: list[np.ndarray] = []
-    likely_noise_screen_parts: list[np.ndarray] = []
+    noise_parts: list[np.ndarray] = []
+    trusted_parts: list[np.ndarray] = []
+    candidate_parts: list[np.ndarray] = []
+    conflict_parts: list[np.ndarray] = []
+    single_parts: list[np.ndarray] = []
     valid_candidates = 0
     uncertain_candidates = 0
     likely_noise_candidates = 0
-    soft_edge_supported_candidates = 0
+    edge_supported = 0
     occluded_view_tests = 0
     normal_rejected_matches = 0
-    opposite_side_rejected_matches = 0
+    side_rejected = 0
+    edge_rejected = 0
     executor = (
         ThreadPoolExecutor(max_workers=CPU_WORKERS)
         if device_name == "cpu"
@@ -679,23 +895,32 @@ def multiview_evidence_processor(
     )
 
     def _run_search(
-        item: tuple[int, object], query_tensor: object
+        item: tuple[int, _EligibleNeighborSearch], query_tensor: object
     ) -> tuple[int, np.ndarray, np.ndarray]:
-        other_index, search = item
-        indices_tensor, squared_distance_tensor = search.knn_search(query_tensor, 1)
+        other_index, eligible_search = item
+        if eligible_search.search is None:
+            raise RuntimeError("cannot query an empty eligible-target index")
+        indices_tensor, squared_distance_tensor = eligible_search.search.knn_search(
+            query_tensor, 1
+        )
+        compact_indices = indices_tensor.cpu().numpy().reshape(-1)
         return (
             other_index,
-            indices_tensor.cpu().numpy().reshape(-1),
+            eligible_search.source_indices[compact_indices],
             squared_distance_tensor.cpu().numpy().reshape(-1),
         )
 
     for index, cloud in enumerate(clouds):
         support_count = np.zeros(len(cloud), dtype=np.int64)
+        consensus_count = np.zeros(len(cloud), dtype=np.int64)
+        shift_sum = np.zeros(len(cloud), dtype=np.float64)
         observable_count = np.zeros(len(cloud), dtype=np.int64)
+        source_normal_data = normalized_normals[index]
         query = o3d.core.Tensor(
             cloud, dtype=o3d.core.Dtype.Float32, device=compute_device
         )
-        eligible_searches: list[tuple[int, object]] = []
+        eligible_searches: list[tuple[int, _EligibleNeighborSearch]] = []
+        observable_by_view: dict[int, np.ndarray] = {}
         for other_index, search in enumerate(searches):
             if other_index == index:
                 continue
@@ -712,19 +937,11 @@ def multiview_evidence_processor(
                     - 180.0
                 )
             if not (
-                config.min_support_angle_degrees - 1e-9
+                evidence_policy.min_angle - 1e-9
                 <= separation
-                <= effective_max_support_angle + 1e-9
+                <= max_angle + 1e-9
             ):
                 continue
-            eligible_searches.append((other_index, search))
-        if executor is None:
-            search_results = (_run_search(item, query) for item in eligible_searches)
-        else:
-            search_results = executor.map(
-                lambda item: _run_search(item, query), eligible_searches
-            )
-        for other_index, neighbor_indices, squared_distances in search_results:
             other_observation = cloud_observations[other_index]
             if not config.use_occlusion_visibility or other_observation is None:
                 observable = np.ones(len(cloud), dtype=bool)
@@ -737,14 +954,24 @@ def multiview_evidence_processor(
                 )
                 occluded_view_tests += occluded
             observable_count += observable
-            target_sensor_valid = hard_sensor_masks[other_index][neighbor_indices]
-            match = observable & target_sensor_valid & (
+            observable_by_view[other_index] = observable
+            if search.search is not None:
+                eligible_searches.append((other_index, search))
+        if executor is None:
+            search_results = (_run_search(item, query) for item in eligible_searches)
+        else:
+            search_results = executor.map(
+                lambda item: _run_search(item, query), eligible_searches
+            )
+        for other_index, neighbor_indices, squared_distances in search_results:
+            other_observation = cloud_observations[other_index]
+            observable = observable_by_view[other_index]
+            match = observable & (
                 squared_distances <= config.support_radius_mm**2
             )
-            source_normal_data = normalized_normals[index]
             target_normal_data = normalized_normals[other_index]
             if (
-                config.min_normal_consistency_cosine is not None
+                config.min_consistency is not None
                 and source_normal_data is not None
                 and target_normal_data is not None
             ):
@@ -756,14 +983,14 @@ def multiview_evidence_processor(
                     np.einsum("ij,ij->i", source_normals, matched_target_normals)
                 )
                 normal_consistent = ~both_valid | (
-                    normal_cosine >= config.min_normal_consistency_cosine
+                    normal_cosine >= config.min_consistency
                 )
                 normal_rejected_matches += int(
                     np.count_nonzero(match & ~normal_consistent)
                 )
                 match &= normal_consistent
             if (
-                config.require_same_observation_side
+                config.require_side
                 and source_normal_data is not None
                 and cloud_observations[index] is not None
                 and cloud_observations[index].camera_origin is not None
@@ -783,15 +1010,35 @@ def multiview_evidence_processor(
                     source_normal_valid & source_view_valid & target_view_valid
                 )
                 same_side = ~direction_valid | (source_facing * target_facing > 0)
-                opposite_side_rejected_matches += int(
+                side_rejected += int(
                     np.count_nonzero(match & ~same_side)
                 )
                 match &= same_side
             support_count += match
+            target_points = clouds[other_index][neighbor_indices]
+            offsets = target_points - cloud
+            strict_match = match.copy()
+            if source_normal_data is None:
+                strict_match &= squared_distances <= config.consensus_mm**2
+            else:
+                source_normals, source_normal_valid = source_normal_data
+                normal_shift = np.einsum("ij,ij->i", offsets, source_normals)
+                plane_error = np.abs(normal_shift)
+                strict_match &= np.where(
+                    source_normal_valid,
+                    plane_error <= config.consensus_mm,
+                    squared_distances <= config.consensus_mm**2,
+                )
+                shift_sum += np.where(
+                    strict_match & source_normal_valid,
+                    normal_shift,
+                    0.0,
+                )
+            consensus_count += strict_match
         supported = support_count >= required_support
         if config.edge_policy == "soft":
             edge_recovery = supported & edge_masks[index] & hard_sensor_masks[index]
-            soft_edge_supported_candidates += int(np.count_nonzero(edge_recovery))
+            edge_supported += int(np.count_nonzero(edge_recovery))
             valid = supported & hard_sensor_masks[index]
         else:
             valid = supported & sensor_masks[index]
@@ -800,9 +1047,36 @@ def multiview_evidence_processor(
             & (observable_count >= required_support)
             & ~sensor_masks[index]
         )
+        class_mask = (
+            hard_sensor_masks[index]
+            if config.edge_policy == "soft"
+            else sensor_masks[index]
+        )
+        strict_need = config.consensus_views - 1
+        trusted = class_mask & (consensus_count >= strict_need)
+        candidate = class_mask & ~trusted & (consensus_count > 0)
+        conflict = (
+            class_mask
+            & ~trusted
+            & ~candidate
+            & (support_count > 0)
+        )
+        single = class_mask & ~trusted & ~candidate & ~conflict
+        trusted_cloud = cloud.copy()
+        if source_normal_data is not None:
+            source_normals, source_normal_valid = source_normal_data
+            shift = shift_sum / (consensus_count + 1)
+            adjusted = trusted & source_normal_valid
+            trusted_cloud[adjusted] += (
+                source_normals[adjusted] * shift[adjusted, None]
+            ).astype(np.float32)
         valid_parts.append(clouds[index][valid])
         uncertain_parts.append(clouds[index][~valid & ~likely_noise_screen])
-        likely_noise_screen_parts.append(clouds[index][likely_noise_screen])
+        noise_parts.append(clouds[index][likely_noise_screen])
+        trusted_parts.append(trusted_cloud[trusted])
+        candidate_parts.append(cloud[candidate])
+        conflict_parts.append(cloud[conflict])
+        single_parts.append(cloud[single])
         valid_candidates += int(np.count_nonzero(valid))
         uncertain_candidates += int(np.count_nonzero(~valid))
         likely_noise_candidates += int(np.count_nonzero(likely_noise_screen))
@@ -822,18 +1096,38 @@ def multiview_evidence_processor(
         config.voxel_size_mm,
         representative=config.voxel_representative,
     )
-    likely_noise_screen_points = voxel_downsample(
-        np.concatenate(likely_noise_screen_parts, axis=0)
-        if any(len(part) for part in likely_noise_screen_parts)
+    noise_screen = voxel_downsample(
+        np.concatenate(noise_parts, axis=0)
+        if any(len(part) for part in noise_parts)
         else np.empty((0, 3)),
         config.voxel_size_mm,
         representative=config.voxel_representative,
     )
+    trusted_points = voxel_downsample(
+        np.concatenate(trusted_parts, axis=0),
+        config.voxel_size_mm,
+        representative=config.voxel_representative,
+    )
+    candidate_cloud = voxel_downsample(
+        np.concatenate(candidate_parts, axis=0),
+        config.voxel_size_mm,
+        representative=config.voxel_representative,
+    )
+    conflict_points = voxel_downsample(
+        np.concatenate(conflict_parts, axis=0),
+        config.voxel_size_mm,
+        representative=config.voxel_representative,
+    )
+    single_points = voxel_downsample(
+        np.concatenate(single_parts, axis=0),
+        config.voxel_size_mm,
+        representative=config.voxel_representative,
+    )
     likely_noise_points = np.empty((0, 3), dtype=np.float32)
-    if len(likely_noise_screen_points) and len(valid_points):
+    if len(noise_screen) and len(valid_points):
         screened_geometry = o3d.geometry.PointCloud(
             o3d.utility.Vector3dVector(
-                likely_noise_screen_points.astype(np.float64, copy=False)
+                noise_screen.astype(np.float64, copy=False)
             )
         )
         valid_geometry = o3d.geometry.PointCloud(
@@ -844,20 +1138,20 @@ def multiview_evidence_processor(
             dtype=np.float64,
         )
         isolated = confirmed_distance > config.component_radius_mm
-        likely_noise_points = likely_noise_screen_points[isolated]
-        near_confirmed = likely_noise_screen_points[~isolated]
+        likely_noise_points = noise_screen[isolated]
+        near_confirmed = noise_screen[~isolated]
         uncertain_points = voxel_downsample(
             np.concatenate((uncertain_points, near_confirmed), axis=0),
             config.voxel_size_mm,
             representative=config.voxel_representative,
         )
-    elif len(likely_noise_screen_points):
+    elif len(noise_screen):
         uncertain_points = voxel_downsample(
-            np.concatenate((uncertain_points, likely_noise_screen_points), axis=0),
+            np.concatenate((uncertain_points, noise_screen), axis=0),
             config.voxel_size_mm,
             representative=config.voxel_representative,
         )
-    valid_points, uncertain_points, components = apply_spatial_component_evidence(
+    valid_points, uncertain_points, components = apply_evidence(
         valid_points, uncertain_points, config
     )
     return MultiviewEvidenceSelection(
@@ -877,18 +1171,31 @@ def multiview_evidence_processor(
         likely_noise_points,
         occluded_view_tests,
         normal_rejected_matches,
-        opposite_side_rejected_matches,
+        side_rejected,
         image_gradient_candidates,
         depth_gradient_candidates,
         normal_change_candidates,
         confidence_drop_candidates,
-        soft_edge_supported_candidates,
+        edge_supported,
         device_name,
-        effective_max_support_angle,
+        max_angle,
+        evidence_policy.min_views,
+        evidence_policy.min_angle,
+        evidence_policy.mode,
+        evidence_policy.view_step,
+        evidence_policy.view_gap,
+        evidence_policy.complete_evidence,
+        edge_rejected,
+        invalid_excluded,
+        edge_excluded,
+        trusted_points,
+        candidate_cloud,
+        conflict_points,
+        single_points,
     )
 
 
-def process_point_cloud(
+def process_cloud(
     manifest_path: str | Path,
     calibration_path: str | Path,
     config: PointCloudProcessingConfig | None = None,
@@ -903,7 +1210,7 @@ def process_point_cloud(
     config.validate()
     calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
     started = time.perf_counter()
-    observations = load_frame_observations(
+    observations = load_observations(
         manifest_path,
         calibration_path,
         angle_sign=config.angle_sign,
@@ -911,49 +1218,83 @@ def process_point_cloud(
     loaded_seconds = time.perf_counter() - started
     frames = [observation.points for observation in observations]
     evidence_started = time.perf_counter()
-    selection = multiview_evidence_processor(
+    selection = process_evidence(
         frames, config, observations=observations, prefer_gpu=prefer_gpu
     )
-    effective_max_support_angle = (
-        selection.effective_max_support_angle_degrees
-        if selection.effective_max_support_angle_degrees is not None
+    max_angle = (
+        selection.max_angle
+        if selection.max_angle is not None
         else (
-            config.max_support_angle_degrees
-            if config.max_support_angle_degrees is not None
+            config.max_angle
+            if config.max_angle is not None
             else 180.0
         )
+    )
+    effective_min_views = (
+        selection.effective_min_views
+        if selection.effective_min_views is not None
+        else (config.min_views if config.min_views is not None else 3)
+    )
+    min_angle = (
+        selection.min_angle
+        if selection.min_angle is not None
+        else config.min_angle
     )
     evidence_seconds = time.perf_counter() - evidence_started
     processed = clean_points(selection.valid_points)
     uncertain = clean_points(selection.uncertain_points)
     likely_noise = clean_points(selection.likely_noise_points)
+    trusted = clean_points(selection.trusted_points)
+    candidate = clean_points(selection.candidate_cloud)
+    conflict = clean_points(selection.conflict_points)
+    single = clean_points(selection.single_points)
     if not len(processed):
         if len(uncertain):
             raise ValueError(
                 "点云没有满足正式测量证据门槛的点；不确定点已保留，请调整质量门槛或补拍"
             )
         raise ValueError("点云处理结果为空")
-    points = to_turntable_coordinates(
+    points = to_turntable(
         processed,
         origin=calibration["origin_mm"],
         axis=calibration["axis"],
     ).astype(np.float32, copy=False)
-    uncertain_points = to_turntable_coordinates(
+    uncertain_points = to_turntable(
         uncertain,
         origin=calibration["origin_mm"],
         axis=calibration["axis"],
     ).astype(np.float32, copy=False)
-    likely_noise_points = to_turntable_coordinates(
+    likely_noise_points = to_turntable(
         likely_noise,
         origin=calibration["origin_mm"],
         axis=calibration["axis"],
     ).astype(np.float32, copy=False)
+    trusted_points = to_turntable(
+        trusted,
+        origin=calibration["origin_mm"],
+        axis=calibration["axis"],
+    ).astype(np.float32, copy=False)
+    candidate_cloud = to_turntable(
+        candidate,
+        origin=calibration["origin_mm"],
+        axis=calibration["axis"],
+    ).astype(np.float32, copy=False)
+    conflict_points = to_turntable(
+        conflict,
+        origin=calibration["origin_mm"],
+        axis=calibration["axis"],
+    ).astype(np.float32, copy=False)
+    single_points = to_turntable(
+        single,
+        origin=calibration["origin_mm"],
+        axis=calibration["axis"],
+    ).astype(np.float32, copy=False)
     coordinate_seconds = time.perf_counter() - evidence_started - evidence_seconds
-    metrics = turntable_overlap_metrics(
+    metrics = turntable_overlap(
         manifest_path,
         axis=calibration["axis"],
         origin=calibration["origin_mm"],
-        voxel_size=config.overlap_voxel_size_mm,
+        voxel_size=config.overlap_voxel,
         angle_sign=config.angle_sign,
         transformed_points=frames,
     )
@@ -981,16 +1322,26 @@ def process_point_cloud(
         "depth_gradient_candidates": selection.depth_gradient_candidates,
         "normal_change_candidates": selection.normal_change_candidates,
         "confidence_drop_candidates": selection.confidence_drop_candidates,
-        "soft_edge_supported_candidates": selection.soft_edge_supported_candidates,
+        "edge_supported": selection.edge_supported,
         "compute_device": selection.compute_device_name,
         "support_angle_degrees": {
             "mode": (
                 "automatic"
-                if config.max_support_angle_degrees is None
+                if config.max_angle is None
                 else "fixed"
             ),
-            "configured_maximum": config.max_support_angle_degrees,
-            "effective_maximum": effective_max_support_angle,
+            "configured_max": config.max_angle,
+            "configured_min": config.min_angle,
+            "effective_min": min_angle,
+            "effective_max": max_angle,
+        },
+        "view_evidence_policy": {
+            "mode": selection.view_evidence_mode,
+            "configured_min_views": config.min_views,
+            "effective_min_views": effective_min_views,
+            "view_step": selection.view_step,
+            "view_gap": selection.view_gap,
+            "complete_evidence": selection.complete_evidence,
         },
         "timing_seconds": {
             "load_and_transform": round(loaded_seconds, 3),
@@ -1003,11 +1354,18 @@ def process_point_cloud(
         "spatial_components": selection.spatial_components,
         "retained_spatial_components": selection.retained_spatial_components,
         "uncertain_output_points": int(len(uncertain_points)),
-        "likely_noise_screen_candidates": selection.likely_noise_candidates,
-        "likely_noise_output_points": int(len(likely_noise_points)),
+        "noise_candidates": selection.likely_noise_candidates,
+        "noise_points": int(len(likely_noise_points)),
         "occluded_view_tests": selection.occluded_view_tests,
         "normal_rejected_matches": selection.normal_rejected_matches,
-        "opposite_side_rejected_matches": selection.opposite_side_rejected_matches,
+        "side_rejected": selection.side_rejected,
+        "edge_rejected": selection.edge_rejected,
+        "edge_rejected_note": (
+            "legacy post-query counter; eligible-target indexing now excludes edge "
+            "targets before nearest-neighbor search"
+        ),
+        "invalid_excluded": selection.invalid_excluded,
+        "edge_excluded": selection.edge_excluded,
         "deletion_policy": (
             "invalid numeric data is removed; a point is classified as likely noise only "
             "when it has zero adjacent-view support, fails sensor evidence, and is farther "
@@ -1019,20 +1377,20 @@ def process_point_cloud(
     metrics["evidence"] = {
         "method": "multiview_support_distance",
         "valid_definition": (
-            f"support_count >= {config.min_views - 1} other views separated by at least "
-            f"{config.min_support_angle_degrees:g} and at most "
-            f"{effective_max_support_angle:g} degrees"
+            f"support_count >= {effective_min_views - 1} other views separated by at least "
+            f"{min_angle:g} and at most "
+            f"{max_angle:g} degrees"
         ),
         "uncertain_definition": (
-            f"support_count < {config.min_views - 1} eligible other views"
+            f"support_count < {effective_min_views - 1} eligible other views"
         ),
         "likely_noise_definition": (
             "zero eligible-view support AND failed sensor evidence AND spatially isolated "
             f"more than {config.component_radius_mm:g} mm from confirmed geometry"
         ),
         "support_constraints": {
-            "normal_consistency_cosine_min": config.min_normal_consistency_cosine,
-            "same_observation_side_required": config.require_same_observation_side,
+            "min_consistency": config.min_consistency,
+            "require_side": config.require_side,
             "occlusion_visibility_enabled": config.use_occlusion_visibility,
             "occlusion_tolerance_mm": config.occlusion_tolerance_mm,
             "occlusion_min_neighbors": config.occlusion_min_neighbors,
@@ -1040,19 +1398,24 @@ def process_point_cloud(
                 "project into the neighbor organized depth map; views with a surface "
                 "closer than the candidate by more than the tolerance are occluded"
             ),
+            "target_index_rule": (
+                "nearest-neighbor indices contain only sensor-valid, non-edge targets; "
+                "invalid nearer points cannot hide an eligible supporting point"
+            ),
         },
         "edge_policy": config.edge_policy,
-        "minimum_support_angle_degrees": config.min_support_angle_degrees,
-        "configured_maximum_support_angle_degrees": config.max_support_angle_degrees,
-        "maximum_support_angle_degrees": effective_max_support_angle,
+        "min_angle": min_angle,
+        "configured_min": config.min_angle,
+        "configured_max": config.max_angle,
+        "max_angle": max_angle,
         "support_angle_mode": (
-            "automatic" if config.max_support_angle_degrees is None else "fixed"
+            "automatic" if config.max_angle is None else "fixed"
         ),
         "sensor_thresholds": {
             "confidence_min": config.confidence_min,
             "edge_uncertain_px": config.edge_uncertain_px,
             "image_gradient_threshold": config.image_gradient_threshold,
-            "depth_gradient_threshold_mm": config.depth_gradient_threshold_mm,
+            "depth_gradient": config.depth_gradient,
             "normal_change_cosine": config.normal_change_cosine,
             "confidence_drop_ratio": config.confidence_drop_ratio,
             "confidence_drop_abs": config.confidence_drop_abs,
@@ -1086,14 +1449,45 @@ def process_point_cloud(
             )
         ),
     }
-    # 保留已有报告字段以兼容下游读取程序
+    metrics["consensus"] = {
+        "method": "local_normal_consensus",
+        "mode": "dual_input",
+        "search_mm": config.support_radius_mm,
+        "agreement_mm": config.consensus_mm,
+        "min_views": config.consensus_views,
+        "trusted_points": int(len(trusted_points)),
+        "candidate_points": int(len(candidate_cloud)),
+        "conflict_points": int(len(conflict_points)),
+        "single_points": int(len(single_points)),
+        "distance_rule": (
+            "absolute point-to-plane distance along the source normal; "
+            "Euclidean distance when the source normal is unavailable"
+        ),
+        "fusion_rule": (
+            "average bounded cross-view offsets along the source normal; "
+            "preserve tangential coordinates and never average conflict points"
+        ),
+        "view_rule": "one nearest eligible match contributes at most one vote per view",
+        "class_rule": (
+            "trusted reaches the configured strict-view threshold; candidate has "
+            "strict support below it; conflict has only broad support; single has no "
+            "eligible cross-view neighbor"
+        ),
+        "output_rule": (
+            "broad formal cloud remains the placement registration input; trusted "
+            "cloud is the downstream measurement input"
+        ),
+    }
+    # 简化摘要供快速检查
     metrics["denoise"] = {
         "method": "multiview_consensus",
         "support_radius_mm": config.support_radius_mm,
-        "min_views": config.min_views,
-        "min_support_angle_degrees": config.min_support_angle_degrees,
-        "configured_max_support_angle_degrees": config.max_support_angle_degrees,
-        "max_support_angle_degrees": effective_max_support_angle,
+        "min_views": effective_min_views,
+        "configured_min_views": config.min_views,
+        "min_angle": min_angle,
+        "configured_min": config.min_angle,
+        "configured_max": config.max_angle,
+        "max_angle": max_angle,
         "output_points": int(len(points)),
     }
     return PointCloudProcessingResult(
@@ -1101,10 +1495,14 @@ def process_point_cloud(
         report=metrics,
         uncertain_points=uncertain_points,
         likely_noise_points=likely_noise_points,
+        trusted_points=trusted_points,
+        candidate_cloud=candidate_cloud,
+        conflict_points=conflict_points,
+        single_points=single_points,
     )
 
 
-def write_processing_result(
+def write_result(
     result: PointCloudProcessingResult,
     cloud_path: str | Path,
     *,
@@ -1117,15 +1515,35 @@ def write_processing_result(
         raise ValueError("点云输出路径必须使用 .ply 后缀")
     cloud_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(cloud_path.with_suffix(".npy"), result.points)
-    write_ascii_ply(cloud_path, result.points)
+    write_ply(cloud_path, result.points)
     uncertain_path = cloud_path.with_name(f"{cloud_path.stem}-uncertain{cloud_path.suffix}")
     np.save(uncertain_path.with_suffix(".npy"), result.uncertain_points)
-    write_ascii_ply(uncertain_path, result.uncertain_points)
+    write_ply(uncertain_path, result.uncertain_points)
     likely_noise_path = cloud_path.with_name(
         f"{cloud_path.stem}-likely-noise{cloud_path.suffix}"
     )
     np.save(likely_noise_path.with_suffix(".npy"), result.likely_noise_points)
-    write_ascii_ply(likely_noise_path, result.likely_noise_points)
+    write_ply(likely_noise_path, result.likely_noise_points)
+    trusted_path = cloud_path.with_name(
+        f"{cloud_path.stem}-trusted{cloud_path.suffix}"
+    )
+    np.save(trusted_path.with_suffix(".npy"), result.trusted_points)
+    write_ply(trusted_path, result.trusted_points)
+    candidate_path = cloud_path.with_name(
+        f"{cloud_path.stem}-candidate{cloud_path.suffix}"
+    )
+    np.save(candidate_path.with_suffix(".npy"), result.candidate_cloud)
+    write_ply(candidate_path, result.candidate_cloud)
+    conflict_path = cloud_path.with_name(
+        f"{cloud_path.stem}-conflict{cloud_path.suffix}"
+    )
+    np.save(conflict_path.with_suffix(".npy"), result.conflict_points)
+    write_ply(conflict_path, result.conflict_points)
+    single_path = cloud_path.with_name(
+        f"{cloud_path.stem}-single{cloud_path.suffix}"
+    )
+    np.save(single_path.with_suffix(".npy"), result.single_points)
+    write_ply(single_path, result.single_points)
     result.report.setdefault("artifacts", {}).update(
         {
             "cloud": str(cloud_path),
@@ -1134,6 +1552,14 @@ def write_processing_result(
             "uncertain_npy": str(uncertain_path.with_suffix(".npy")),
             "likely_noise": str(likely_noise_path),
             "likely_noise_npy": str(likely_noise_path.with_suffix(".npy")),
+            "trusted": str(trusted_path),
+            "trusted_npy": str(trusted_path.with_suffix(".npy")),
+            "candidate": str(candidate_path),
+            "candidate_npy": str(candidate_path.with_suffix(".npy")),
+            "conflict": str(conflict_path),
+            "conflict_npy": str(conflict_path.with_suffix(".npy")),
+            "single": str(single_path),
+            "single_npy": str(single_path.with_suffix(".npy")),
         }
     )
     if report_path is not None:

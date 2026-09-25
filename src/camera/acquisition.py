@@ -68,12 +68,23 @@ class CaptureStoragePolicy:
     save_confidence: bool = False
     save_normals: bool = False
     save_image_npy: bool = False
-    save_processed_cloud_ply: bool = False
+    save_ply: bool = False
     save_source_indices: bool = False
 
     @classmethod
     def compact(cls) -> "CaptureStoragePolicy":
         return cls()
+
+    @classmethod
+    def metrology(cls) -> "CaptureStoragePolicy":
+        """Keep sensor evidence required by formal measurement fusion."""
+
+        return cls(
+            save_depth=True,
+            save_confidence=True,
+            save_normals=True,
+            save_source_indices=True,
+        )
 
     @classmethod
     def complete(cls) -> "CaptureStoragePolicy":
@@ -82,7 +93,7 @@ class CaptureStoragePolicy:
             save_confidence=True,
             save_normals=True,
             save_image_npy=True,
-            save_processed_cloud_ply=True,
+            save_ply=True,
             save_source_indices=True,
         )
 
@@ -338,7 +349,7 @@ class Camera(AbstractContextManager["Camera"]):
         cloud = frame.points if cloud_points is None else np.asarray(cloud_points, dtype=np.float32)
         np.save(layout.write_path("processed", "cloud.npy"), cloud.astype(np.float32, copy=False))
         # 将 SDK 组织好的点图保存为 float32
-        # 磁盘单位保持米以兼容 process_turntable_capture
+        # 磁盘单位保持米以兼容 process_capture
         # 重建时再由流程转换为毫米
         array_files: dict[str, str] = {
             "cloud_npy": layout.relative(layout.write_path("processed", "cloud.npy")),
@@ -361,8 +372,8 @@ class Camera(AbstractContextManager["Camera"]):
         point_map_path = layout.write_path("processed", "cloud.ply")
         finite = cloud.reshape(-1, 3)
         finite = finite[np.isfinite(finite).all(axis=1)]
-        if policy.save_processed_cloud_ply:
-            _write_ascii_ply(point_map_path, finite)
+        if policy.save_ply:
+            _write_ply(point_map_path, finite)
         image_path: str | None = None
         image_info: dict[str, Any] | None = None
         if frame.image is not None:
@@ -382,7 +393,7 @@ class Camera(AbstractContextManager["Camera"]):
         files = {
             "image": image_path,
             **array_files,
-            "cloud_ply": layout.relative(point_map_path) if policy.save_processed_cloud_ply else None,
+            "cloud_ply": layout.relative(point_map_path) if policy.save_ply else None,
         }
         metadata: dict[str, Any] = {
             "captured_at": frame.captured_at,
@@ -393,7 +404,7 @@ class Camera(AbstractContextManager["Camera"]):
                 "artifacts": frame.sdk_artifacts,
                 "arrays": array_files,
                 "depth_unit": "m",
-                "sdk_point_map_unit": "m",
+                "sdk_unit": "m",
                 "confidence_unit": "sdk-defined",
                 "normal_unit": "unit_vector",
             },
@@ -408,14 +419,14 @@ class Camera(AbstractContextManager["Camera"]):
             json.dumps(metadata, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        return point_map_path if policy.save_processed_cloud_ply else layout.write_path("processed", "cloud.npy")
+        return point_map_path if policy.save_ply else layout.write_path("processed", "cloud.npy")
 
     def _require_open(self) -> None:
         if self.handle is None or not self.handle.IsOpen():
             raise RuntimeError("RVC 相机尚未打开")
 
 
-def _write_ascii_ply(path: Path, points: np.ndarray) -> None:
+def _write_ply(path: Path, points: np.ndarray) -> None:
     with path.open("w", encoding="ascii", newline="\n") as handle:
         handle.write("ply\nformat ascii 1.0\n")
         handle.write(f"element vertex {len(points)}\n")

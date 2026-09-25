@@ -12,7 +12,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from .transforms import transform_about_axis
+from .transforms import rotate_axis
 
 
 
@@ -80,7 +80,7 @@ def voxel_downsample(
     return points[np.sort(keep)]
 
 
-def write_ascii_ply(path: str | Path, points: np.ndarray) -> Path:
+def write_ply(path: str | Path, points: np.ndarray) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     finite = clean_points(points)
@@ -92,7 +92,7 @@ def write_ascii_ply(path: str | Path, points: np.ndarray) -> Path:
     return path
 
 
-def _nearest_grid_distances(source: np.ndarray, target: np.ndarray, cell_size: float) -> np.ndarray:
+def _grid_distances(source: np.ndarray, target: np.ndarray, cell_size: float) -> np.ndarray:
     """Approximate source-to-target nearest distances using a uniform grid."""
 
     source = clean_points(source)
@@ -132,7 +132,7 @@ def overlap_metrics(
     target = voxel_downsample(clean_points(target), voxel_size)
     if len(source) > max_points:
         source = source[np.linspace(0, len(source) - 1, max_points, dtype=np.int64)]
-    distances = _nearest_grid_distances(source, target, voxel_size)
+    distances = _grid_distances(source, target, voxel_size)
     if not len(distances):
         return {"overlap_points": 0.0, "overlap_ratio": 0.0}
     return {
@@ -143,7 +143,7 @@ def overlap_metrics(
     }
 
 
-def turntable_overlap_metrics(
+def turntable_overlap(
     manifest_path: str | Path,
     *,
     axis: Iterable[float],
@@ -162,7 +162,7 @@ def turntable_overlap_metrics(
         for frame in payload.get("frames", []):
             points = np.load((root / frame["path"]).with_suffix(".npy"))
             transformed.append(
-                transform_about_axis(
+                rotate_axis(
                     points,
                     origin=origin,
                     axis=axis,

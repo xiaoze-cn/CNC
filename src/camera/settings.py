@@ -7,7 +7,7 @@ from typing import Any
 from .acquisition import Camera
 
 
-def _set_hdr_options(
+def _set_hdr(
     options: Any,
     exposures: tuple[int, ...],
     brightness: tuple[int, ...],
@@ -31,7 +31,7 @@ def _set_hdr_options(
                 raise ValueError(f"SDK rejected HDR {label} {value!r} at index {index}")
 
 
-def capture_options_for_profile(
+def profile_options(
     camera: Camera,
     profile: str,
     *,
@@ -97,7 +97,7 @@ def capture_options_for_profile(
         options.smooth_sigma = 5.0
         exposures = (3, 6, 10)
         brightness = (240, 240, 240)
-        _set_hdr_options(options, exposures, brightness)
+        _set_hdr(options, exposures, brightness)
         return options
 
     options.capture_mode = (
@@ -126,7 +126,7 @@ def capture_options_for_profile(
         else:
             exposures = (3, 10, 30)
             brightness = (80, 160, 240)
-        _set_hdr_options(options, exposures, brightness)
+        _set_hdr(options, exposures, brightness)
     else:
         options.hdr_exposure_times = 0
         options.exposure_time_3d = 10

@@ -29,7 +29,7 @@ def rotation_matrix(axis: Iterable[float], angle_degrees: float) -> np.ndarray:
     )
 
 
-def transform_about_axis(
+def rotate_axis(
     points: np.ndarray,
     *,
     origin: Iterable[float],
@@ -51,7 +51,7 @@ def transform_about_axis(
     return result
 
 
-def to_turntable_coordinates(
+def to_turntable(
     points: np.ndarray,
     *,
     origin: Iterable[float],

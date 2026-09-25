@@ -114,7 +114,7 @@ def detect_rotator(
     raise InterfaceError(f"未检测到匹配的转台；已尝试 {', '.join(candidates)}。{details}")
 
 
-def _add_connection_options(
+def _add_options(
     parser: argparse.ArgumentParser,
     *,
     timeout: float = 1.0,
@@ -140,7 +140,7 @@ def _drive_command(
     help_text: str,
 ) -> argparse.ArgumentParser:
     command = commands.add_parser(name, help=help_text)
-    _add_connection_options(command)
+    _add_options(command)
     return command
 
 
@@ -152,7 +152,7 @@ def _parser() -> argparse.ArgumentParser:
 
     commands.add_parser("ports", help="列出串口")
     detect = commands.add_parser("detect", help="只读探测并验证唯一的转台串口")
-    _add_connection_options(detect, timeout=0.5, retries=0)
+    _add_options(detect, timeout=0.5, retries=0)
     _drive_command(commands, "status", "读取实时运行状态")
     _drive_command(commands, "check", "检查通信、报警和停止状态")
     _drive_command(commands, "stop", "停止运动并保持使能")

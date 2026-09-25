@@ -31,7 +31,7 @@ from .protocol import (
     p3,
     p4,
     pa,
-    position_slot_registers,
+    slot_registers,
 )
 
 
@@ -284,7 +284,7 @@ class _Controller:
             relay_state=values[21],
             run_state=values[22],
             external_voltage_state=values[23],
-            absolute_position=self._decode_i64_words_low_first(values[24:28]),
+            absolute_position=self._decode_i64(values[24:28]),
         )
 
     def check(self, *, stopped: bool = True, alarm: bool = False) -> CheckResult:
@@ -325,7 +325,7 @@ class _Controller:
         self.stop()
         self._write_pa(PA.FORCE_ENABLE, 0, temporary=True)
         self._write_p3(P3.VIRTUAL_INPUT_STATE, 0)
-        return self._wait_until_stopped()
+        return self._wait_stopped()
 
     def stop(self) -> RotatorStatus:
         """Best-effort communication stop; hardware E-stop is still required."""
@@ -346,7 +346,7 @@ class _Controller:
             raise RotatorError(
                 "communication stop was incomplete; use the hardware power cut/E-stop"
             ) from errors[-1]
-        return self._wait_until_stopped()
+        return self._wait_stopped()
 
     def clear(self, *, confirm: str) -> RotatorStatus:
         """Clear a resettable alarm only after zeroing commands and disabling."""
@@ -400,7 +400,7 @@ class _Controller:
         self._validate_speed(speed, allow_zero=False)
         if speed < 1:
             raise SafetyError("maximum speed must be positive")
-        self._validate_torque_limit(torque)
+        self._validate_limit(torque)
         if not self.limits.ramp <= ramp <= 10000:
             raise SafetyError(
                 f"ramp must be {self.limits.ramp}..10000 ms"
@@ -490,7 +490,7 @@ class _Controller:
             return status
         raise RotatorError("drive did not return after software restart") from last_error
 
-    def _configure_internal_speed(
+    def _configure_speed(
         self,
         *,
         maximum_rpm: int,
@@ -500,7 +500,7 @@ class _Controller:
         self._validate_speed(maximum_rpm, allow_zero=False)
         if maximum_rpm < 1:
             raise SafetyError("maximum speed must be positive")
-        self._validate_torque_limit(torque_limit_percent)
+        self._validate_limit(torque_limit_percent)
         if not self.limits.ramp <= ramp_ms <= 10000:
             raise SafetyError(
                 f"ramp must be {self.limits.ramp}..10000 ms"
@@ -541,10 +541,10 @@ class _Controller:
         torque = torque or self.limits.torque
         if limit < 1:
             raise SafetyError("maximum speed must be positive")
-        self._validate_overspeed_margin(abs(rpm), limit)
+        self._validate_overspeed(abs(rpm), limit)
 
         report = self.check(stopped=True)
-        self._require_active_mode(report.status, ControlMode.SPEED)
+        self._require_mode(report.status, ControlMode.SPEED)
         restore = self._snapshot_pa(
             PA.SPEED_SOURCE,
             PA.MAXIMUM_SPEED,
@@ -557,7 +557,7 @@ class _Controller:
         )
         samples = []
         try:
-            self._configure_internal_speed(
+            self._configure_speed(
                 maximum_rpm=limit,
                 torque_limit_percent=torque,
                 ramp_ms=ramp,
@@ -579,7 +579,7 @@ class _Controller:
         finally:
             self._write_pa(PA.INTERNAL_SPEED_1, 0, temporary=True)
             try:
-                self._wait_until_stopped()
+                self._wait_stopped()
             finally:
                 self._restore_pa(restore)
         final_status = self.status()
@@ -591,13 +591,13 @@ class _Controller:
             motion_elapsed,
         )
 
-    def _configure_internal_torque(
+    def _configure_torque(
         self, *, speed_limit_rpm: int, torque_limit_percent: int
     ) -> None:
         self._validate_speed(speed_limit_rpm, allow_zero=False)
         if speed_limit_rpm < 1:
             raise SafetyError("torque-mode speed limit must be positive")
-        self._validate_torque_limit(torque_limit_percent)
+        self._validate_limit(torque_limit_percent)
         self._write_pa(PA.INTERNAL_TORQUE_1, 0, temporary=True)
         self._write_pa(PA.TORQUE_MODE_SPEED_LIMIT, speed_limit_rpm, temporary=True)
         self._write_pa(
@@ -609,7 +609,7 @@ class _Controller:
         self._write_pa(PA.TORQUE_SOURCE, TorqueSource.INTERNAL, temporary=True)
 
     def _set_torque(self, percent: int, *, confirm: str | None = None) -> None:
-        self._validate_torque_command(percent)
+        self._validate_torque(percent)
         if percent:
             self._require_confirmation(confirm, "TORQUE")
         self._write_pa(PA.INTERNAL_TORQUE_1, percent, temporary=True)
@@ -624,11 +624,11 @@ class _Controller:
     ) -> MotionResult:
         self._require_confirmation(confirm, "TORQUE")
         self._validate_duration(duration)
-        self._validate_torque_command(percent)
+        self._validate_torque(percent)
         if percent == 0:
             raise SafetyError("torque command must not be zero")
         report = self.check(stopped=True)
-        self._require_active_mode(report.status, ControlMode.TORQUE)
+        self._require_mode(report.status, ControlMode.TORQUE)
         restore = self._snapshot_pa(
             PA.TORQUE_SOURCE,
             PA.TORQUE_MODE_SPEED_LIMIT,
@@ -638,7 +638,7 @@ class _Controller:
         )
         samples = []
         try:
-            self._configure_internal_torque(
+            self._configure_torque(
                 speed_limit_rpm=speed,
                 torque_limit_percent=max(abs(percent), 1),
             )
@@ -684,7 +684,7 @@ class _Controller:
             self._write_p3(int(P3.VIRTUAL_DI1_FUNCTION) + offset, int(function))
         self._write_p3(P3.VIRTUAL_IO_MODE, 2)
 
-    def _virtual_io_is_configured(self, profile: str | None = None) -> bool:
+    def _io_ready(self, profile: str | None = None) -> bool:
         if self._read_p3(P3.VIRTUAL_IO_MODE) != 2:
             return False
         actual = self.client.read(
@@ -721,7 +721,7 @@ class _Controller:
             ControlMode.SPEED_TORQUE,
         }:
             raise ValueError("only PA4 mixed control modes 3, 4, and 5 are accepted")
-        if not self._virtual_io_is_configured("mixed"):
+        if not self._io_ready("mixed"):
             raise ConfigError(
                 "mixed virtual IO profile is not configured"
             )
@@ -740,7 +740,7 @@ class _Controller:
             ControlMode.SPEED_TORQUE: (ControlMode.SPEED, ControlMode.TORQUE),
         }
         expected = active_modes[mode][int(secondary)]
-        self._require_active_mode(status, expected)
+        self._require_mode(status, expected)
         return status
 
     def jog(
@@ -752,14 +752,14 @@ class _Controller:
         confirm: str,
     ) -> MotionResult:
         self._require_confirmation(confirm, "MOVE")
-        self._require_virtual_io()
+        self._require_io()
         self._validate_duration(duration)
         self._validate_speed(rpm, allow_zero=False)
         if rpm < 1:
             raise SafetyError("JOG speed must be positive; direction is a separate argument")
-        self._validate_overspeed_margin(rpm, self.limits.speed)
+        self._validate_overspeed(rpm, self.limits.speed)
         report = self.check(stopped=True)
-        self._require_active_mode(report.status, ControlMode.SPEED)
+        self._require_mode(report.status, ControlMode.SPEED)
         if direction not in {"positive", "negative"}:
             raise ValueError("direction must be positive or negative")
         bit = (
@@ -795,7 +795,7 @@ class _Controller:
         finally:
             self._write_p3(P3.VIRTUAL_INPUT_STATE, 0)
             try:
-                self._wait_until_stopped()
+                self._wait_stopped()
             finally:
                 self._restore_pa(restore)
         return MotionResult(
@@ -826,7 +826,7 @@ class _Controller:
             raise ValueError(
                 "pulses must fit signed 16-bit; also respect the configured pulses/revolution"
             )
-        turns_address, pulses_address, speed_address = position_slot_registers(slot)
+        turns_address, pulses_address, speed_address = slot_registers(slot)
         self._write_verified(p4(P4.POSITION_COMMAND_MODE), int(mode))
         self._write_verified(turns_address, self._word(turns))
         self._write_verified(pulses_address, self._word(pulses))
@@ -841,20 +841,20 @@ class _Controller:
         confirm: str,
     ) -> MotionResult:
         self._require_confirmation(confirm, "MOVE")
-        self._require_virtual_io()
+        self._require_io()
         self._validate_duration(timeout)
         torque = (
             self.limits.torque
             if torque is None
             else torque
         )
-        self._validate_torque_limit(torque)
-        _, _, speed_address = position_slot_registers(slot)
+        self._validate_limit(torque)
+        _, _, speed_address = slot_registers(slot)
         report = self.check(stopped=True)
-        self._require_active_mode(report.status, ControlMode.POSITION)
-        self._require_safe_position_error(report.status)
+        self._require_mode(report.status, ControlMode.POSITION)
+        self._require_position(report.status)
         slot_speed = self._read_one(speed_address)
-        self._validate_overspeed_margin(
+        self._validate_overspeed(
             slot_speed, self._read_pa(PA.MAXIMUM_SPEED)
         )
         restore = self._snapshot_pa(
@@ -929,7 +929,7 @@ class _Controller:
         finally:
             self._write_p3(P3.VIRTUAL_INPUT_STATE, 0)
             try:
-                self._wait_until_stopped()
+                self._wait_stopped()
             finally:
                 self._restore_pa(restore)
         return MotionResult(
@@ -987,7 +987,7 @@ class _Controller:
     ) -> MotionResult:
         """Run the already configured homing sequence through virtual SHOM."""
         self._require_confirmation(confirm, "HOME")
-        self._require_virtual_io()
+        self._require_io()
         self._validate_duration(timeout)
         direction_source = self._read_p4(P4.HOMING_DIRECTION_SOURCE)
         trigger_mode = self._read_p4(P4.HOMING_TRIGGER_MODE)
@@ -1001,12 +1001,12 @@ class _Controller:
             )
         self._validate_speed(high_speed, allow_zero=False)
         self._validate_speed(low_speed, allow_zero=False)
-        self._validate_overspeed_margin(
+        self._validate_overspeed(
             high_speed, self._read_pa(PA.MAXIMUM_SPEED)
         )
         start_status = self.check(stopped=True).status
-        self._require_active_mode(start_status, ControlMode.POSITION)
-        self._require_safe_position_error(start_status)
+        self._require_mode(start_status, ControlMode.POSITION)
+        self._require_position(start_status)
         restore = self._snapshot_pa(PA.POSITION_INPUT_MODE)
         samples = []
         try:
@@ -1048,7 +1048,7 @@ class _Controller:
         finally:
             self._write_p3(P3.VIRTUAL_INPUT_STATE, 0)
             try:
-                self._wait_until_stopped()
+                self._wait_stopped()
             finally:
                 self._restore_pa(restore)
         return MotionResult(
@@ -1059,7 +1059,7 @@ class _Controller:
             motion_elapsed,
         )
 
-    def _wait_until_stopped(self) -> RotatorStatus:
+    def _wait_stopped(self) -> RotatorStatus:
         deadline = time.monotonic() + self.limits.timeout
         last = self.status()
         while time.monotonic() < deadline:
@@ -1079,7 +1079,7 @@ class _Controller:
         return values[0]
 
     @staticmethod
-    def _decode_i64_words_low_first(words: list[int]) -> int:
+    def _decode_i64(words: list[int]) -> int:
         if len(words) != 4:
             raise RotatorError("64-bit status value requires four registers")
         value = 0
@@ -1123,21 +1123,21 @@ class _Controller:
         for parameter, value in values.items():
             self._write_pa(parameter, value, temporary=True)
 
-    def _require_virtual_io(self) -> None:
-        if not self._virtual_io_is_configured():
+    def _require_io(self) -> None:
+        if not self._io_ready():
             raise ConfigError(
                 "virtual IO profile is not configured; call setup('position') first"
             )
 
     @staticmethod
-    def _require_active_mode(status: RotatorStatus, expected: ControlMode) -> None:
+    def _require_mode(status: RotatorStatus, expected: ControlMode) -> None:
         if status.control_mode != int(expected):
             raise ConfigError(
                 f"active control mode is {status.control_mode}, expected {int(expected)}; "
                 "call setup with the required mode first"
             )
 
-    def _require_safe_position_error(self, status: RotatorStatus) -> None:
+    def _require_position(self, status: RotatorStatus) -> None:
         if (
             abs(status.position_error_pulses)
             > self.limits.error
@@ -1155,13 +1155,13 @@ class _Controller:
                 f"speed {rpm} rpm exceeds safety limit {self.limits.speed} rpm"
             )
 
-    def _validate_torque_limit(self, percent: int) -> None:
+    def _validate_limit(self, percent: int) -> None:
         if not 1 <= percent <= self.limits.torque:
             raise SafetyError(
                 f"torque limit must be 1..{self.limits.torque}%"
             )
 
-    def _validate_overspeed_margin(
+    def _validate_overspeed(
         self, command_rpm: int, overspeed_limit_rpm: int
     ) -> None:
         minimum = command_rpm + self.limits.margin
@@ -1171,7 +1171,7 @@ class _Controller:
                 f"{command_rpm} rpm command"
             )
 
-    def _validate_torque_command(self, percent: int) -> None:
+    def _validate_torque(self, percent: int) -> None:
         if abs(percent) > self.limits.torque:
             raise SafetyError(
                 f"torque {percent}% exceeds safety limit "
@@ -1371,8 +1371,8 @@ class Rotator:
         if duration is not None:
             self._driver._validate_duration(duration)
         report = self._driver.check(stopped=True)
-        self._driver._require_active_mode(report.status, ControlMode.SPEED)
-        self._driver._configure_internal_speed(
+        self._driver._require_mode(report.status, ControlMode.SPEED)
+        self._driver._configure_speed(
             maximum_rpm=self._motor,
             torque_limit_percent=self.torque,
             ramp_ms=self.ramp,
@@ -1440,15 +1440,15 @@ class Rotator:
         if confirm != "MOVE":
             raise SafetyError("position motion requires confirm='MOVE'")
         torque = self.torque if torque is None else torque
-        self._driver._validate_torque_limit(torque)
+        self._driver._validate_limit(torque)
         if calculation.estimate + 3 > self.timeout:
             raise SafetyError(
                 f"motion needs about {calculation.estimate:.2f}s but timeout is "
                 f"{self.timeout:.2f}s"
             )
         report = self._driver.check(stopped=True)
-        self._driver._require_active_mode(report.status, ControlMode.POSITION)
-        self._driver._require_safe_position_error(report.status)
+        self._driver._require_mode(report.status, ControlMode.POSITION)
+        self._driver._require_position(report.status)
         restore = self._driver._snapshot_pa(
             PA.MAXIMUM_SPEED,
             PA.ACCELERATION_TIME,

@@ -10,18 +10,20 @@ from typing import Any
 import numpy as np
 import open3d as o3d
 
-from inspection.reconstruction.observations import load_frame_observations
-from inspection.geometry.transforms import to_turntable_coordinates
+from inspection.reconstruction.observations import load_observations
+from inspection.geometry.transforms import to_turntable
 
 from .deviation import (
     DEFAULT_TOLERANCE_MM,
-    _cloud_to_mesh_distances,
-    _cloud_to_mesh_signed_distances,
+    _cloud_distances,
+    _signed_distances,
+    _classify_deviation,
     _distance_colors,
     _load_points,
+    _direction_quality,
     _write_cloud,
 )
-from .model import load_step_mesh
+from .model import load_mesh
 
 
 @dataclass(frozen=True)
@@ -36,7 +38,7 @@ _SIDE_ALIASES = {
 }
 
 
-def _resolve_side_dir(root: Path, side: str) -> tuple[str, Path]:
+def _resolve_side(root: Path, side: str) -> tuple[str, Path]:
     key = side.lower().strip()
     if key not in _SIDE_ALIASES:
         raise ValueError("side must be a or b")
@@ -60,8 +62,8 @@ def _resolve_alignment(merge: dict[str, Any], side: str, legacy_name: str) -> np
     alignments = merge.get("alignments", {})
     for name in (_SIDE_ALIASES[side][0], legacy_name):
         entry = alignments.get(name)
-        if entry and "transform_cloud_to_step" in entry:
-            transform = np.asarray(entry["transform_cloud_to_step"], dtype=np.float64)
+        if entry and "step_transform" in entry:
+            transform = np.asarray(entry["step_transform"], dtype=np.float64)
             if transform.shape != (4, 4) or not np.isfinite(transform).all():
                 raise ValueError(f"{name} 的 STEP 位姿矩阵无效")
             return transform
@@ -73,7 +75,7 @@ def _apply_transform(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return (transform[:3, :3] @ points.T).T + transform[:3, 3]
 
 
-def _nearest_match_count(points: np.ndarray, path: Path, radius_mm: float) -> int:
+def _match_count(points: np.ndarray, path: Path, radius_mm: float) -> int:
     if not len(points) or not path.is_file():
         return 0
     target = _load_points(path)
@@ -91,7 +93,7 @@ def _nearest_match_count(points: np.ndarray, path: Path, radius_mm: float) -> in
     return matched
 
 
-def _formal_frame_mask(
+def _frame_mask(
     points: np.ndarray,
     side_dir: Path,
     *,
@@ -136,7 +138,7 @@ def trace_frame(
         raise ValueError("视角编号必须从 1 开始")
 
     side_key = side.lower().strip()
-    legacy_name, side_dir = _resolve_side_dir(root, side_key)
+    legacy_name, side_dir = _resolve_side(root, side_key)
     state_path = root / "inspection.json"
     merge_path = root / "merge.json"
     if not state_path.is_file():
@@ -171,7 +173,7 @@ def trace_frame(
             .get("config", {})
             .get("angle_sign", angle_sign)
         )
-    observations = load_frame_observations(
+    observations = load_observations(
         manifest_path,
         calibration_path,
         angle_sign=angle_sign,
@@ -183,7 +185,7 @@ def trace_frame(
     observation = observations[frame_number - 1]
     transform = _resolve_alignment(merge, side_key, legacy_name)
     calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
-    turntable_points = to_turntable_coordinates(
+    turntable_points = to_turntable(
         observation.points,
         origin=calibration["origin_mm"],
         axis=calibration["axis"],
@@ -196,7 +198,7 @@ def trace_frame(
         0.1,
         2.0 * float(processing_config.get("voxel_size_mm", 0.05)),
     )
-    formal_mask, formal_filter_used = _formal_frame_mask(
+    formal_mask, formal_filter_used = _frame_mask(
         turntable_points,
         side_dir,
         radius_mm=formal_filter_radius,
@@ -204,12 +206,22 @@ def trace_frame(
     filtered_turntable_points = turntable_points[formal_mask]
     aligned_points = _apply_transform(filtered_turntable_points, transform)
 
-    mesh = load_step_mesh(step_path, tolerance)
-    distances = _cloud_to_mesh_distances(mesh, aligned_points)
-    signed_distances = _cloud_to_mesh_signed_distances(mesh, aligned_points)
-    exterior_mask = (distances > tolerance) & (signed_distances > 0.0)
-    recessed_mask = (distances > tolerance) & (signed_distances < 0.0)
-    normal_mask = ~(exterior_mask | recessed_mask)
+    mesh = load_mesh(step_path, tolerance)
+    distances = _cloud_distances(mesh, aligned_points)
+    direction_quality = _direction_quality(mesh)
+    signed_distances = (
+        _signed_distances(mesh, aligned_points)
+        if direction_quality["reliable"]
+        else None
+    )
+    deviation = _classify_deviation(
+        mesh,
+        distances,
+        tolerance,
+        signed_distances=signed_distances,
+        signed_distance_reliable=direction_quality["reliable"],
+    )
+    normal_mask = ~(deviation.problem_mask | deviation.recessed_mask)
 
     output_dir = root / "trace" / f"{_SIDE_ALIASES[side_key][0]}_{frame_number:03d}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -220,13 +232,17 @@ def trace_frame(
     )
     _write_cloud(
         output_dir / "problem.ply",
-        aligned_points[exterior_mask],
-        colors=_distance_colors(distances[exterior_mask], tolerance, kind="problem"),
+        aligned_points[deviation.problem_mask],
+        colors=_distance_colors(
+            distances[deviation.problem_mask], tolerance, kind="problem"
+        ),
     )
     _write_cloud(
         output_dir / "recessed.ply",
-        aligned_points[recessed_mask],
-        colors=_distance_colors(distances[recessed_mask], tolerance, kind="recessed"),
+        aligned_points[deviation.recessed_mask],
+        colors=_distance_colors(
+            distances[deviation.recessed_mask], tolerance, kind="recessed"
+        ),
     )
     _write_cloud(
         output_dir / "coverage.ply",
@@ -236,6 +252,7 @@ def trace_frame(
     # 单个视角无法区分未观测的背面和 STEP 中真实缺失的区域
     # 使用空缺失点云保持渲染器接口一致
     _write_cloud(output_dir / "missing.ply", np.empty((0, 3), dtype=np.float64))
+    _write_cloud(output_dir / "unobserved.ply", np.empty((0, 3), dtype=np.float64))
     o3d.io.write_triangle_mesh(str(output_dir / "mesh.ply"), mesh)
     np.save(output_dir / "cloud.npy", aligned_points.astype(np.float32))
 
@@ -244,6 +261,20 @@ def trace_frame(
     final_recessed = root / "view" / "recessed.ply"
     report = {
         "status": "ok",
+        "processing_status": "ok",
+        "status_scope": "processing_only",
+        "conformance": {
+            "status": "indeterminate",
+            "reasons": [
+                "a single frame cannot establish surface coverage",
+                "feature-level acceptance rules are not configured",
+                *(
+                    []
+                    if deviation.signed_distance_reliable
+                    else ["STEP tessellation is not watertight; deviation direction is unavailable"]
+                ),
+            ],
+        },
         "mode": "single-frame-trace",
         "source": str(root),
         "side": side_key,
@@ -253,7 +284,7 @@ def trace_frame(
         "commanded_angle_degrees": observation.angle_degrees,
         "step": str(step_path),
         "tolerance_mm": tolerance,
-        "raw_frame_point_count": int(len(turntable_points)),
+        "raw_points": int(len(turntable_points)),
         "formal_reconstruction_filter": {
             "used": formal_filter_used,
             "radius_mm": formal_filter_radius,
@@ -262,10 +293,25 @@ def trace_frame(
             "note": "frame points are retained only when represented by the formal side cloud",
         },
         "point_cloud_count": int(len(aligned_points)),
+        "mesh_direction_quality": direction_quality,
         "classification": {
             "within_tolerance_count": int(np.count_nonzero(normal_mask)),
-            "exterior_bad_count": int(np.count_nonzero(exterior_mask)),
-            "recessed_bad_count": int(np.count_nonzero(recessed_mask)),
+            "mode": deviation.mode,
+            "signed_distance_reliable": deviation.signed_distance_reliable,
+            "unsigned_bad_count": int(np.count_nonzero(distances > tolerance)),
+            "exterior_bad_count": (
+                int(np.count_nonzero(deviation.exterior_mask))
+                if deviation.signed_distance_reliable
+                else None
+            ),
+            "recessed_bad_count": (
+                int(np.count_nonzero(deviation.recessed_mask))
+                if deviation.signed_distance_reliable
+                else None
+            ),
+            "unclassified_bad_count": int(
+                np.count_nonzero(deviation.unclassified_mask)
+            ),
             "missing_not_evaluated": True,
         },
         "qualified_point_cloud": {
@@ -276,11 +322,24 @@ def trace_frame(
         },
         "final_bad_overlap": {
             "match_radius_mm": final_match_radius,
-            "exterior_match_count": _nearest_match_count(
-                aligned_points[exterior_mask], final_problem, final_match_radius
+            "problem_match_count": _match_count(
+                aligned_points[deviation.problem_mask],
+                final_problem,
+                final_match_radius,
             ),
-            "recessed_match_count": _nearest_match_count(
-                aligned_points[recessed_mask], final_recessed, final_match_radius
+            "exterior_match_count": (
+                _match_count(
+                    aligned_points[deviation.exterior_mask],
+                    final_problem,
+                    final_match_radius,
+                )
+                if deviation.signed_distance_reliable
+                else None
+            ),
+            "recessed_match_count": _match_count(
+                aligned_points[deviation.recessed_mask],
+                final_recessed,
+                final_match_radius,
             ),
             "note": "nearest-neighbor attribution to final bad clouds; approximate",
         },
@@ -291,6 +350,7 @@ def trace_frame(
             "recessed": str(output_dir / "recessed.ply"),
             "coverage": str(output_dir / "coverage.ply"),
             "missing": str(output_dir / "missing.ply"),
+            "unobserved": str(output_dir / "unobserved.ply"),
             "mesh": str(output_dir / "mesh.ply"),
         },
         "note": (
@@ -298,4 +358,8 @@ def trace_frame(
             "because a single camera angle naturally leaves occluded surface unobserved."
         ),
     }
+    (output_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return TraceResult(report=report, output_dir=output_dir)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,15 +11,177 @@ import cv2
 import numpy as np
 from camera.acquisition import CaptureLayout
 
-from .calibration import fit_run_plane, project_to_plane, solve_axis_calibration
+from .calibration import fit_plane, project_plane, solve_axis
 
-def _load_capture_metadata(capture_dir: Path) -> dict[str, Any]:
+
+@dataclass(frozen=True, slots=True)
+class CalibrationQualityLimits:
+    """Conservative run-level gates derived from recorded calibration residuals."""
+
+    minimum_frames: int = 6
+    minimum_median_matches: float = 6.0
+    min_image_ratio: float = 0.80
+    max_gap: float = 75.0
+    plane_rms: float = 0.35
+    axis_residual: float = 0.075
+    fit_rms: float = 0.30
+    angle_error: float = 0.25
+    image_rms: float = 0.30
+    pixel_rms: float = 1.50
+    pixel_angle: float = 0.35
+    cross_angle: float = 0.35
+
+
+def _max_gap(angles: list[float]) -> float | None:
+    if len(angles) < 2:
+        return None
+    normalized = np.unique(np.mod(np.asarray(angles, dtype=np.float64), 360.0))
+    if len(normalized) < 2:
+        return 360.0
+    gaps = np.diff(np.r_[normalized, normalized[0] + 360.0])
+    return float(np.max(gaps))
+
+
+def evaluate_quality(
+    tracking: dict[str, Any],
+    limits: CalibrationQualityLimits | None = None,
+) -> dict[str, Any]:
+    """Evaluate whether a solved marker run is safe to use for reconstruction."""
+
+    limits = limits or CalibrationQualityLimits()
+    summary = tracking.get("summary", {})
+    calibration = tracking.get("calibration", {})
+    image_plane = tracking.get("image_plane", {})
+    frames = int(summary.get("frames", 0) or 0)
+    successful = int(summary.get("successful_frames", 0) or 0)
+    image_markers = int(image_plane.get("markers", 0) or 0)
+    image_inliers = int(image_plane.get("inliers", 0) or 0)
+    image_inlier_ratio = (
+        float(image_inliers / image_markers) if image_markers > 0 else None
+    )
+    maximum_view_gap = _max_gap(
+        [float(value) for value in calibration.get("source_angles_degrees", [])]
+    )
+    measurements = {
+        "frames": frames,
+        "successful_frames": successful,
+        "median_matches": summary.get("median_matches"),
+        "image_ratio": image_inlier_ratio,
+        "max_gap": maximum_view_gap,
+        "plane_rms_mm": calibration.get("plane_rms_mm"),
+        "axis_residual_mm": calibration.get("axis_residual_mm"),
+        "fit_max": summary.get("fit_max"),
+        "angle_max": summary.get("angle_max"),
+        "image_rms": image_plane.get("rms_mm"),
+        "pixel_max": summary.get("pixel_max"),
+        "pixel_angle_max": summary.get("pixel_angle_max"),
+        "cross_angle_max": summary.get("cross_angle_max"),
+        "pixel_frames": summary.get("pixel_frames"),
+    }
+    checks: dict[str, dict[str, Any]] = {}
+
+    def minimum_check(name: str, value: Any, minimum: float) -> None:
+        passed = value is not None and np.isfinite(value) and float(value) >= minimum
+        checks[name] = {
+            "status": "pass" if passed else "fail",
+            "value": value,
+            "minimum": minimum,
+        }
+
+    def maximum_check(name: str, value: Any, maximum: float) -> None:
+        passed = value is not None and np.isfinite(value) and float(value) <= maximum
+        checks[name] = {
+            "status": "pass" if passed else "fail",
+            "value": value,
+            "maximum": maximum,
+        }
+
+    minimum_check("frames", frames, limits.minimum_frames)
+    checks["all_tracked"] = {
+        "status": "pass" if frames > 0 and successful == frames else "fail",
+        "value": successful,
+        "expected": frames,
+    }
+    checks["all_angles"] = {
+        "status": (
+            "pass"
+            if frames > 0
+            and measurements["pixel_frames"] == frames
+            else "fail"
+        ),
+        "value": measurements["pixel_frames"],
+        "expected": frames,
+    }
+    minimum_check(
+        "median_matches",
+        measurements["median_matches"],
+        limits.minimum_median_matches,
+    )
+    minimum_check(
+        "image_ratio",
+        image_inlier_ratio,
+        limits.min_image_ratio,
+    )
+    maximum_check(
+        "max_gap",
+        maximum_view_gap,
+        limits.max_gap,
+    )
+    maximum_check(
+        "plane_rms_mm", measurements["plane_rms_mm"], limits.plane_rms
+    )
+    maximum_check(
+        "axis_residual_mm",
+        measurements["axis_residual_mm"],
+        limits.axis_residual,
+    )
+    maximum_check(
+        "fit_max",
+        measurements["fit_max"],
+        limits.fit_rms,
+    )
+    maximum_check(
+        "angle_max",
+        measurements["angle_max"],
+        limits.angle_error,
+    )
+    maximum_check(
+        "image_rms",
+        measurements["image_rms"],
+        limits.image_rms,
+    )
+    maximum_check(
+        "pixel_max",
+        measurements["pixel_max"],
+        limits.pixel_rms,
+    )
+    maximum_check(
+        "pixel_angle_max",
+        measurements["pixel_angle_max"],
+        limits.pixel_angle,
+    )
+    maximum_check(
+        "cross_angle_max",
+        measurements["cross_angle_max"],
+        limits.cross_angle,
+    )
+    failures = [name for name, check in checks.items() if check["status"] != "pass"]
+    return {
+        "status": "pass" if not failures else "fail",
+        "basis": "conservative limits derived from recorded run residuals; not a measurement uncertainty budget",
+        "limits": asdict(limits),
+        "measurements": measurements,
+        "checks": checks,
+        "failures": failures,
+    }
+
+def _load_metadata(capture_dir: Path) -> dict[str, Any]:
     layout = CaptureLayout(capture_dir)
     path = layout.resolve("capture.json")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _mutual_nearest_pairs(
+def _nearest_pairs(
     reference: np.ndarray,
     observed: np.ndarray,
     *,
@@ -47,7 +210,7 @@ def _mutual_nearest_pairs(
     )
 
 
-def _signed_angle_degrees(rotation: np.ndarray, axis: np.ndarray) -> float:
+def _signed_angle(rotation: np.ndarray, axis: np.ndarray) -> float:
     skew = np.asarray(
         (
             rotation[2, 1] - rotation[1, 2],
@@ -61,7 +224,7 @@ def _signed_angle_degrees(rotation: np.ndarray, axis: np.ndarray) -> float:
     return float(np.rad2deg(np.arctan2(sine, cosine)))
 
 
-def _pixel_homography_metrics(
+def _homography_metrics(
     reference_pixels: np.ndarray,
     observed_pixels: np.ndarray,
 ) -> dict[str, float | int | None]:
@@ -91,7 +254,7 @@ def _pixel_homography_metrics(
     }
 
 
-def _turntable_plane_coordinates(
+def _plane_coordinates(
     points: np.ndarray, origin: np.ndarray, axis: np.ndarray
 ) -> np.ndarray:
     camera_x = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
@@ -105,7 +268,7 @@ def _turntable_plane_coordinates(
     return np.column_stack((relative @ x_axis, relative @ y_axis))
 
 
-def _rigid_transform_2d(
+def _rigid_2d(
     source: np.ndarray, target: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, float]:
     source_center = source.mean(axis=0)
@@ -122,14 +285,14 @@ def _rigid_transform_2d(
     return rotation, translation, rms
 
 
-def _track_pixels_on_plane(
+def _track_pixels(
     reference: np.ndarray,
     observed: np.ndarray,
     *,
     commanded_angle_degrees: float,
     maximum_distance_mm: float,
 ) -> dict[str, float | int]:
-    match = _match_planar_markers(
+    match = _match_markers(
         reference,
         observed,
         commanded_angle_degrees=commanded_angle_degrees,
@@ -161,7 +324,7 @@ def _marker_arrays(metadata: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     return points.reshape(-1, 3), pixels.reshape(-1, 2)
 
 
-def _match_planar_markers(
+def _match_markers(
     reference: np.ndarray,
     observed: np.ndarray,
     *,
@@ -180,7 +343,7 @@ def _match_planar_markers(
     best: tuple[int, float, np.ndarray, np.ndarray, np.ndarray] | None = None
     for translation in translations:
         aligned = rotated + translation
-        reference_indices, observed_indices, distances = _mutual_nearest_pairs(
+        reference_indices, observed_indices, distances = _nearest_pairs(
             reference,
             aligned,
             maximum_distance_mm=maximum_distance_mm,
@@ -201,12 +364,12 @@ def _match_planar_markers(
         return None
 
     _, initial_rms, _, reference_indices, observed_indices = best
-    rotation, translation, rms = _rigid_transform_2d(
+    rotation, translation, rms = _rigid_2d(
         observed[observed_indices], reference[reference_indices]
     )
     for _ in range(3):
         aligned = observed @ rotation.T + translation
-        next_reference, next_observed, _ = _mutual_nearest_pairs(
+        next_reference, next_observed, _ = _nearest_pairs(
             reference,
             aligned,
             maximum_distance_mm=maximum_distance_mm,
@@ -214,7 +377,7 @@ def _match_planar_markers(
         if len(next_reference) < 6:
             break
         reference_indices, observed_indices = next_reference, next_observed
-        rotation, translation, rms = _rigid_transform_2d(
+        rotation, translation, rms = _rigid_2d(
             observed[observed_indices], reference[reference_indices]
         )
     return (
@@ -227,7 +390,7 @@ def _match_planar_markers(
     )
 
 
-def analyze_marker_tracks(
+def analyze_tracks(
     manifest_path: str | Path,
     calibration_path: str | Path,
     *,
@@ -250,22 +413,22 @@ def analyze_marker_tracks(
     frame_data: list[tuple[dict[str, Any], np.ndarray, np.ndarray]] = []
     for record in records:
         capture_dir = manifest_path.parent / record["directory"]
-        points, pixels = _marker_arrays(_load_capture_metadata(capture_dir))
+        points, pixels = _marker_arrays(_load_metadata(capture_dir))
         if len(points) < 6:
             raise ValueError(f"frame {record['index']} has fewer than 6 markers")
         frame_data.append((record, points, pixels))
 
-    plane_center, axis, x_axis, y_axis, plane_rms = fit_run_plane(
+    plane_center, axis, x_axis, y_axis, plane_rms = fit_plane(
         [points for _, points, _ in frame_data], prior_axis
     )
     plane_points = [
-        project_to_plane(points, plane_center, x_axis, y_axis)
+        project_plane(points, plane_center, x_axis, y_axis)
         for _, points, _ in frame_data
     ]
     reference_record, _, reference_pixels = frame_data[0]
     reference_plane = plane_points[0]
     reference_angle = float(reference_record["degrees"])
-    image_to_plane, image_to_plane_mask = cv2.findHomography(
+    image_to_plane, plane_mask = cv2.findHomography(
         reference_pixels,
         reference_plane,
         cv2.RANSAC,
@@ -273,20 +436,24 @@ def analyze_marker_tracks(
         maxIters=5000,
         confidence=0.999,
     )
-    if image_to_plane is None or image_to_plane_mask is None:
+    if image_to_plane is None or plane_mask is None:
         raise ValueError("unable to calibrate the image-to-turntable-plane homography")
-    reference_plane_from_pixels = cv2.perspectiveTransform(
+    pixel_reference = cv2.perspectiveTransform(
         reference_pixels.reshape(1, -1, 2), image_to_plane
     ).reshape(-1, 2)
     plane_calibration_residuals = np.linalg.norm(
-        reference_plane_from_pixels - reference_plane, axis=1
+        pixel_reference - reference_plane, axis=1
     )
-    plane_calibration_inliers = image_to_plane_mask.reshape(-1).astype(bool)
+    plane_calibration_inliers = plane_mask.reshape(-1).astype(bool)
+    if int(np.count_nonzero(plane_calibration_inliers)) < 4:
+        raise ValueError(
+            "image-to-turntable-plane homography has fewer than 4 inliers"
+        )
 
     frames: list[dict[str, Any]] = []
     for (record, _, observed_pixels), observed_plane in zip(frame_data, plane_points):
         commanded = float(record["degrees"]) - reference_angle
-        match = _match_planar_markers(
+        match = _match_markers(
             reference_plane,
             observed_plane,
             commanded_angle_degrees=commanded,
@@ -309,7 +476,7 @@ def analyze_marker_tracks(
         measured = (-mapping_angle) % 360.0
         commanded_normalized = commanded % 360.0
         angle_error = ((measured - commanded_normalized + 180.0) % 360.0) - 180.0
-        observed_plane_from_pixels = cv2.perspectiveTransform(
+        pixel_observed = cv2.perspectiveTransform(
             observed_pixels.reshape(1, -1, 2), image_to_plane
         ).reshape(-1, 2)
         frames.append(
@@ -322,14 +489,14 @@ def analyze_marker_tracks(
                 "reference_markers": int(len(reference_plane)),
                 "observed_markers": int(len(observed_plane)),
                 "matches": int(len(reference_indices)),
-                "initial_match_rms_mm": float(initial_rms),
+                "initial_rms": float(initial_rms),
                 "fit_rms_mm": float(rms),
-                "pixel_homography": _pixel_homography_metrics(
+                "pixel_homography": _homography_metrics(
                     reference_pixels[reference_indices], observed_pixels[observed_indices]
                 ),
-                "pixel_angle": _track_pixels_on_plane(
-                    reference_plane_from_pixels,
-                    observed_plane_from_pixels,
+                "pixel_angle": _track_pixels(
+                    pixel_reference,
+                    pixel_observed,
                     commanded_angle_degrees=commanded,
                     maximum_distance_mm=maximum_distance_mm,
                 ),
@@ -338,7 +505,7 @@ def analyze_marker_tracks(
             }
         )
 
-    calibration, summary, successful_count = solve_axis_calibration(
+    calibration, summary, successful_count = solve_axis(
         frames,
         reference_index=int(reference_record["index"]),
         plane_center=plane_center,
@@ -347,14 +514,14 @@ def analyze_marker_tracks(
         y_axis=y_axis,
         plane_rms=plane_rms,
     )
-    return {
+    result = {
         "status": "ok" if successful_count == len(frames) else "partial",
         "method": "current-run-plane-and-translation-voting",
         "manifest": str(manifest_path),
         "orientation_reference": str(calibration_path),
-        "maximum_match_distance_mm": float(maximum_distance_mm),
+        "match_limit": float(maximum_distance_mm),
         "reference_frame": int(reference_record["index"]),
-        "image_to_plane_calibration": {
+        "image_plane": {
             "inliers": int(plane_calibration_inliers.sum()),
             "markers": int(len(reference_pixels)),
             "rms_mm": float(np.sqrt(np.mean(plane_calibration_residuals[plane_calibration_inliers] ** 2))),
@@ -364,9 +531,13 @@ def analyze_marker_tracks(
         "calibration": calibration,
         "frames": frames,
     }
+    result["quality_gate"] = evaluate_quality(result)
+    if result["status"] == "ok" and result["quality_gate"]["status"] != "pass":
+        result["status"] = "quality_failed"
+    return result
 
 
-def estimate_calibration_from_tracks(
+def estimate_calibration(
     manifest_path: str | Path,
     calibration_path: str | Path,
     *,
@@ -374,7 +545,7 @@ def estimate_calibration_from_tracks(
 ) -> dict[str, Any]:
     """Estimate the current axis and center without reusing a prior center."""
 
-    tracking = analyze_marker_tracks(
+    tracking = analyze_tracks(
         manifest_path,
         calibration_path,
         maximum_distance_mm=maximum_distance_mm,
@@ -391,8 +562,15 @@ def estimate_calibration_from_tracks(
             if frame.get("status") != "ok"
         ]
         summary = tracking.get("summary", {})
+        quality_failures = tracking.get("quality_gate", {}).get("failures", [])
+        if quality_failures:
+            raise ValueError(
+                "标记标定质量门禁失败：" + ", ".join(quality_failures)
+            )
         raise ValueError(
             f"标记跟踪失败：完成 {summary.get('successful_frames', 0)}/"
             f"{summary.get('frames', 0)} 帧，失败帧 {failed}。"
         )
-    return dict(tracking["calibration"])
+    calibration = dict(tracking["calibration"])
+    calibration["quality_gate"] = tracking["quality_gate"]
+    return calibration

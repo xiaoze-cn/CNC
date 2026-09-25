@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -22,20 +23,13 @@ from inspection.operations import (
 )
 from rotator import detect_rotator
 from inspection.viewer import main as show_viewer
-from inspection.storage import compact_inspection_root
+from inspection.storage import compact_root
 
 
 DEFAULT_MODEL = Path("data/model/镜头架.STEP")
 DEFAULT_CALIBRATION = (
     Path(__file__).resolve().parent / "inspection" / "markers" / "turntable.json"
 )
-
-
-def _reflection_threshold(value: str) -> int:
-    threshold = int(value)
-    if not 0 <= threshold <= 30:
-        raise argparse.ArgumentTypeError("反射去噪阈值必须在 0 到 30 之间")
-    return threshold
 
 
 def _frame_count(value: str) -> int:
@@ -89,7 +83,25 @@ def _frame_number(value: str) -> int:
     return frame
 
 
-def _add_capture_options(
+def _expand_args(argv: list[str] | None) -> list[str]:
+    values = list(sys.argv[1:] if argv is None else argv)
+    if not values or values[0] != "show":
+        return values
+    expanded: list[str] = []
+    for index, value in enumerate(values):
+        if index:
+            try:
+                cell = float(value[2:]) if value.startswith("--") else -1.0
+            except ValueError:
+                cell = -1.0
+            if cell > 0:
+                expanded.extend(("--blue", "--blue-cell", str(cell)))
+                continue
+        expanded.append(value)
+    return expanded
+
+
+def _add_options(
     parser: argparse.ArgumentParser,
     *,
     include_output: bool = False,
@@ -104,46 +116,31 @@ def _add_capture_options(
     parser.add_argument("--port", default=None, help="转台串口，默认自动探测")
     parser.add_argument(
         "--frames",
-        "-frames",
         dest="frames",
         type=_frame_count,
         default=ScanConfig().frames,
         metavar="N",
         help="每个放置面整圈采集帧数，默认 18；步进角自动计算为 360/N",
     )
-    parser.add_argument(
-        "-reflect",
-        dest="reflection_threshold",
-        type=_reflection_threshold,
-        default=6,
-        metavar="N",
-        help="SDK 反射去噪阈值 0-30，默认 6；数值越大过滤越强",
-    )
-    parser.add_argument(
-        "-z",
-        dest="z_range",
-        nargs=2,
-        type=float,
-        metavar=("MIN", "MAX"),
-        default=None,
-        help="定位后按相机坐标系 Z 轴保留点云，单位 mm；不指定则不裁剪",
-    )
     storage = parser.add_mutually_exclusive_group()
     storage.add_argument(
         "--storage-profile",
-        choices=("compact", "complete"),
-        default="compact",
-        help="采集文件保留级别，默认 compact；complete 保留传感器证据数组",
+        choices=("compact", "metrology", "complete"),
+        default="metrology",
+        help=(
+            "采集文件保留级别，默认 metrology；metrology 保留计量融合需要的"
+            "传感器证据，complete 还保留诊断用冗余文件"
+        ),
     )
     storage.add_argument(
-        "-complete",
+        "--complete",
         dest="storage_profile",
         action="store_const",
         const="complete",
         help="保留完整传感器证据数组",
     )
     if include_gpu:
-        parser.add_argument("-gpu", dest="prefer_gpu", action="store_true", help="使用 GPU 加速点云匹配")
+        parser.add_argument("--gpu", dest="prefer_gpu", action="store_true", help="使用 GPU 加速点云匹配")
     if include_tolerance:
         parser.add_argument(
             "--lim",
@@ -155,28 +152,48 @@ def _add_capture_options(
         )
 
 
-def _show(path: Path | None, *, color_mode: str = "height", show_blue: bool = False) -> int:
+def _show(
+    path: Path | None,
+    *,
+    color_mode: str = "green",
+    show_blue: bool = False,
+    show_evidence: bool = False,
+    blue_cell: float = 0.75,
+) -> int:
+    if blue_cell <= 0:
+        raise ValueError("blue_cell must be positive")
     viewer_args = ["--color-mode", color_mode]
     if show_blue:
-        viewer_args.append("-blue")
+        viewer_args.append("--blue")
+        viewer_args.extend(("--blue-cell", str(blue_cell)))
+    if show_evidence:
+        viewer_args.append("--evidence")
     if path is None:
         try:
-            show_comparison(_latest_comparison())
+            show_comparison(
+                _latest_comparison(),
+                show_blue=show_blue,
+                blue_cell=blue_cell,
+            )
             return 0
         except FileNotFoundError:
             return show_viewer(viewer_args)
     if not path.exists():
         raise FileNotFoundError(path)
     if path.is_file() and path.name == "report.json":
-        show_comparison(path.parent)
+        show_comparison(path.parent, show_blue=show_blue, blue_cell=blue_cell)
         return 0
     if path.is_dir():
         comparison = path / "view"
         if (comparison / "report.json").is_file():
-            show_comparison(comparison)
+            show_comparison(
+                comparison,
+                show_blue=show_blue,
+                blue_cell=blue_cell,
+            )
             return 0
         if (path / "report.json").is_file() and (path / "mesh.ply").is_file():
-            show_comparison(path)
+            show_comparison(path, show_blue=show_blue, blue_cell=blue_cell)
             return 0
     return show_viewer([str(path), *viewer_args])
 
@@ -187,7 +204,12 @@ def _parser() -> argparse.ArgumentParser:
 
     inspect = commands.add_parser("inspect", help="交互执行多放置面检测")
     inspect.add_argument("model", nargs="?", type=Path, default=DEFAULT_MODEL, help="STEP 模型")
-    _add_capture_options(inspect, include_output=True, include_gpu=True, include_tolerance=True)
+    _add_options(inspect, include_output=True, include_gpu=True, include_tolerance=True)
+    inspect.add_argument(
+        "--consensus",
+        action="store_true",
+        help="多放置面冲突改用一致性优先，默认使用标称优先",
+    )
 
     trace = commands.add_parser(
         "trace",
@@ -221,7 +243,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     merge.add_argument("source", type=Path, help="包含 placement_A 等放置面目录的检测目录")
     merge.add_argument("model", nargs="?", type=Path, default=None, help="STEP 模型；默认从检测记录读取")
-    merge.add_argument("-gpu", dest="prefer_gpu", action="store_true", help="使用 GPU 加速单面点云证据匹配")
+    merge.add_argument("--gpu", dest="prefer_gpu", action="store_true", help="使用 GPU 加速单面点云证据匹配")
     merge.add_argument(
         "--lim",
         dest="tolerance",
@@ -230,20 +252,37 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_TOLERANCE_MM,
         help=f"超差阈值，默认 {DEFAULT_TOLERANCE_MM:g} mm",
     )
+    merge.add_argument(
+        "--consensus",
+        action="store_true",
+        help="多放置面冲突改用一致性优先，默认使用标称优先",
+    )
 
     show = commands.add_parser("show", help="查看最近一次或指定结果")
     show.add_argument("path", nargs="?", type=Path, default=None, help="结果目录、报告、点云或图像")
     show.add_argument(
         "--color-mode",
         choices=("green", "yellow", "gray", "height"),
-        default="height",
-        help="单独点云预览配色，默认纵向黄绿渐变；green 为纯绿色；yellow 为纯浅黄色；gray 为中性灰",
+        default="green",
+        help="单独点云预览配色，默认统一深绿；height 为纵向渐变；yellow 为纯浅黄；gray 为中性灰",
     )
     show.add_argument(
-        "-blue",
+        "--blue",
         dest="show_blue",
         action="store_true",
-        help="单独点云预览时叠加蓝色 STEP 缺失点",
+        help="叠加蓝色 STEP 未观测区域",
+    )
+    show.add_argument(
+        "--blue-cell",
+        type=float,
+        default=0.75,
+        help=argparse.SUPPRESS,
+    )
+    show.add_argument(
+        "--evidence",
+        dest="show_evidence",
+        action="store_true",
+        help="按可信、候选、冲突、单次四色显示局部多视角证据",
     )
 
     commands.add_parser("doctor", help="检查相机和转台是否在线")
@@ -263,14 +302,14 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _wait_for_first_placement() -> str:
+def _wait_first() -> str:
     try:
         return input("放置面 A 完成后继续：")
     except EOFError as exc:
         raise RuntimeError("当前终端不能读取放置面命令") from exc
 
 
-def _wait_for_placement() -> str:
+def _wait_placement() -> str:
     try:
         return input("重新放置工件后继续：")
     except EOFError as exc:
@@ -278,7 +317,7 @@ def _wait_for_placement() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    args = _parser().parse_args(_expand_args(argv))
     if args.command == "inspect":
         if not args.model.is_file():
             raise FileNotFoundError(f"STEP 模型文件不存在: {args.model}")
@@ -288,20 +327,20 @@ def main(argv: list[str] | None = None) -> int:
             ScanConfig(
                 port=args.port,
                 frames=args.frames,
-                reflection_filter_threshold=args.reflection_threshold,
-                z_min_mm=None if args.z_range is None else args.z_range[0],
-                z_max_mm=None if args.z_range is None else args.z_range[1],
             ),
             args.calibration or _latest_calibration(),
             args.model,
-            wait_for_placement=_wait_for_placement,
-            wait_for_first_placement=_wait_for_first_placement,
+            wait_for_placement=_wait_placement,
+            wait_first=_wait_first,
             camera_config=CameraConfig(),
             tolerance_mm=args.tolerance,
             prefer_gpu=args.prefer_gpu,
+            fusion_mode="consensus" if args.consensus else "nominal",
             storage_policy=(
                 CaptureStoragePolicy.complete()
                 if args.storage_profile == "complete"
+                else CaptureStoragePolicy.metrology()
+                if args.storage_profile == "metrology"
                 else CaptureStoragePolicy.compact()
             ),
         )
@@ -315,11 +354,14 @@ def main(argv: list[str] | None = None) -> int:
         started = time.perf_counter()
         print("[merge] 重建合并和 STEP 对比开始", flush=True)
         try:
+            mode = "consensus" if args.consensus else "nominal"
+            print(f"[merge] 融合策略：{mode}", flush=True)
             result = merge_placements(
                 source,
                 args.model,
                 tolerance_mm=args.tolerance,
                 prefer_gpu=args.prefer_gpu,
+                fusion_mode=mode,
             )
         except BaseException:
             elapsed = time.perf_counter() - started
@@ -351,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
             args.path,
             color_mode=args.color_mode,
             show_blue=args.show_blue,
+            show_evidence=args.show_evidence,
+            blue_cell=args.blue_cell,
         )
     if args.command == "doctor":
         devices = Camera.list_devices()
@@ -368,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if args.command == "compact":
-        summary = compact_inspection_root(args.root, dry_run=args.dry_run)
+        summary = compact_root(args.root, dry_run=args.dry_run)
         action = "预计释放" if args.dry_run else "已释放"
         print(
             json.dumps(

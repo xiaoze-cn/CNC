@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 
-def fit_run_plane(
+def fit_plane(
     frame_points: list[np.ndarray], prior_axis: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     points = np.concatenate(frame_points, axis=0)
@@ -28,7 +28,7 @@ def fit_run_plane(
     return center, axis, x_axis, y_axis, float(np.sqrt(np.mean(residuals**2)))
 
 
-def project_to_plane(
+def project_plane(
     points: np.ndarray,
     center: np.ndarray,
     x_axis: np.ndarray,
@@ -53,7 +53,7 @@ def _metric(values: list[float], operation: str) -> float | None:
     return float(np.max(array))
 
 
-def solve_axis_calibration(
+def solve_axis(
     frames: list[dict[str, Any]],
     *,
     reference_index: int,
@@ -89,7 +89,7 @@ def solve_axis_calibration(
         transform = np.eye(4)
         transform[:3, :3] = rotation_3d
         transform[:3, 3] = origin - rotation_3d @ origin
-        frame["transform_observed_to_reference"] = transform.tolist()
+        frame["frame_transform"] = transform.tolist()
 
     pixel_angle_frames = [
         frame for frame in moving if frame["pixel_angle"].get("status") == "ok"
@@ -110,17 +110,17 @@ def solve_axis_calibration(
         "frames": len(frames),
         "successful_frames": len(successful),
         "median_matches": _metric([frame["matches"] for frame in successful], "median"),
-        "angle_error_mean_degrees": _metric(
+        "angle_mean": _metric(
             [frame["angle_error_degrees"] for frame in moving], "mean"
         ),
-        "angle_error_max_abs_degrees": _metric(
+        "angle_max": _metric(
             [frame["angle_error_degrees"] for frame in moving], "max_abs"
         ),
-        "fit_rms_median_mm": _metric(
+        "fit_median": _metric(
             [frame["fit_rms_mm"] for frame in moving], "median"
         ),
-        "fit_rms_max_mm": _metric([frame["fit_rms_mm"] for frame in moving], "max"),
-        "pixel_rms_median_px": _metric(
+        "fit_max": _metric([frame["fit_rms_mm"] for frame in moving], "max"),
+        "pixel_median": _metric(
             [
                 frame["pixel_homography"]["rms_px"]
                 for frame in moving
@@ -128,7 +128,7 @@ def solve_axis_calibration(
             ],
             "median",
         ),
-        "pixel_rms_max_px": _metric(
+        "pixel_max": _metric(
             [
                 frame["pixel_homography"]["rms_px"]
                 for frame in moving
@@ -136,26 +136,26 @@ def solve_axis_calibration(
             ],
             "max",
         ),
-        "pixel_angle_successful_frames": len(pixel_angle_frames) + 1,
-        "pixel_angle_error_mean_degrees": _metric(
+        "pixel_frames": len(pixel_angle_frames) + 1,
+        "pixel_angle_mean": _metric(
             [frame["pixel_angle"]["angle_error_degrees"] for frame in pixel_angle_frames],
             "mean",
         ),
-        "pixel_angle_error_max_abs_degrees": _metric(
+        "pixel_angle_max": _metric(
             [frame["pixel_angle"]["angle_error_degrees"] for frame in pixel_angle_frames],
             "max_abs",
         ),
-        "pixel_to_3d_angle_median_abs_degrees": _metric(
+        "cross_angle_median": _metric(
             pixel_differences, "median_abs"
         ),
-        "pixel_to_3d_angle_max_abs_degrees": _metric(pixel_differences, "max_abs"),
+        "cross_angle_max": _metric(pixel_differences, "max_abs"),
     }
     frame_rms = [float(frame["fit_rms_mm"]) for frame in moving]
     calibration = {
         "axis": axis.tolist(),
         "origin_mm": origin.tolist(),
         "frame_rms_mm": frame_rms,
-        "marker_match_rms_mm": frame_rms,
+        "match_rms": frame_rms,
         "axis_residual_mm": float(np.sqrt(np.mean(center_residuals**2))),
         "plane_normal": axis.tolist(),
         "plane_offset_mm": -float(np.dot(axis, plane_center)),
@@ -171,7 +171,7 @@ def solve_axis_calibration(
             if frame["status"] == "ok"
         ],
         "matched_frames": len(successful),
-        "median_matches_per_frame": summary["median_matches"],
+        "median_matches": summary["median_matches"],
         "tracking_summary": summary,
     }
     return calibration, summary, len(successful)

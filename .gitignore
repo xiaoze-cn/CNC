@@ -1,8 +1,7 @@
 .pixi/
-__pycache__/
 *.py[cod]
+__pycache__/
 
-# Generated inspection and tuning runs are local working data, not source.
+
+3D Model/
 data/inspect/
-data/tuning/
-data/calibrate/

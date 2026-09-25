@@ -41,7 +41,7 @@ class CompactionSummary:
         )
 
 
-def _save_float32_atomic(path: Path) -> int:
+def _save_atomic(path: Path) -> int:
     """Convert an array in place without leaving a partially written source."""
 
     array = np.load(path, mmap_mode="r", allow_pickle=False)
@@ -100,7 +100,7 @@ def compact_capture(capture_dir: str | Path, *, dry_run: bool = False) -> Compac
     converted = 0
     converted_reclaimed = 0
     if not dry_run:
-        converted_reclaimed = _save_float32_atomic(points_path)
+        converted_reclaimed = _save_atomic(points_path)
         converted = int(converted_reclaimed > 0)
         _update_metadata(capture_dir)
     elif points_path.stat().st_size:
@@ -126,7 +126,7 @@ def compact_capture(capture_dir: str | Path, *, dry_run: bool = False) -> Compac
     )
 
 
-def compact_inspection_root(root: str | Path, *, dry_run: bool = False) -> CompactionSummary:
+def compact_root(root: str | Path, *, dry_run: bool = False) -> CompactionSummary:
     """Compact every capture below an inspection/acquisition root."""
 
     root = Path(root)

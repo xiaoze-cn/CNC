@@ -373,7 +373,7 @@ VIRTUAL_IO_MIXED_PROFILE = (
 )
 
 
-def position_slot_registers(slot: int) -> tuple[int, int, int]:
+def slot_registers(slot: int) -> tuple[int, int, int]:
     if not 1 <= slot <= 8:
         raise ValueError("position slot must be between 1 and 8")
     first = 2 + (slot - 1) * 3

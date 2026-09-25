@@ -10,11 +10,11 @@ from typing import Any
 import numpy as np
 
 from camera.acquisition import Camera, CaptureLayout, CaptureStoragePolicy
-from inspection.geometry.pointcloud import clean_points, write_ascii_ply
-from inspection.geometry.transforms import rotation_matrix, transform_about_axis
+from inspection.geometry.pointcloud import clean_points, write_ply
+from inspection.geometry.transforms import rotation_matrix, rotate_axis
 from inspection.markers.detection import (
-    attach_marker_component_coordinates,
-    detect_marker_components,
+    attach_coordinates,
+    detect_markers,
     load_mono8,
 )
 
@@ -32,16 +32,16 @@ _MIN_MARKERS = 6
 class TurntableLocation:
     axis: tuple[float, float, float]
     center_mm: tuple[float, float, float]
-    marker_plane_offset_mm: float
-    marker_plane_rms_mm: float
+    plane_offset: float
+    plane_rms: float
     marker_count: int
-    marker_radius_min_mm: float
-    marker_radius_max_mm: float
+    radius_min: float
+    radius_max: float
     subject_radius_mm: float
-    marker_circle_fit_count: int = 0
-    marker_circle_radius_median_mm: float | None = None
-    marker_circle_rms_median_mm: float | None = None
-    marker_circle_rms_max_mm: float | None = None
+    circle_count: int = 0
+    radius_median: float | None = None
+    rms_median: float | None = None
+    rms_max: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +61,7 @@ class FrameObservation:
     intrinsics: tuple[float, float, float, float] | None = None
 
 
-def normal_incidence_cosine(points: np.ndarray, normals: np.ndarray) -> np.ndarray:
+def normal_cosine(points: np.ndarray, normals: np.ndarray) -> np.ndarray:
     points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     normals = np.asarray(normals, dtype=np.float64).reshape(-1, 3)
     if len(points) != len(normals):
@@ -97,8 +97,8 @@ def locate_turntable(
     axis = np.asarray(calibration["axis"], dtype=np.float64).reshape(3)
     axis /= np.linalg.norm(axis)
     origin = np.asarray(calibration["origin_mm"], dtype=np.float64).reshape(3)
-    candidates = detect_marker_components(image, roi=roi, threshold=marker_threshold)
-    candidates = attach_marker_component_coordinates(
+    candidates = detect_markers(image, roi=roi, threshold=marker_threshold)
+    candidates = attach_coordinates(
         candidates,
         image,
         points,
@@ -175,25 +175,25 @@ def locate_turntable(
     location = TurntableLocation(
         axis=tuple(float(value) for value in axis),
         center_mm=tuple(float(value) for value in center),
-        marker_plane_offset_mm=plane_offset,
-        marker_plane_rms_mm=float(np.sqrt(np.mean(plane_residuals**2))),
+        plane_offset=plane_offset,
+        plane_rms=float(np.sqrt(np.mean(plane_residuals**2))),
         marker_count=len(marker_points),
-        marker_radius_min_mm=radius_min,
-        marker_radius_max_mm=radius_max,
+        radius_min=radius_min,
+        radius_max=radius_max,
         subject_radius_mm=float(radius_max * 0.75),
-        marker_circle_fit_count=len(fitted),
-        marker_circle_radius_median_mm=(
+        circle_count=len(fitted),
+        radius_median=(
             float(np.median(circle_radii)) if len(circle_radii) else None
         ),
-        marker_circle_rms_median_mm=(
+        rms_median=(
             float(np.median(circle_rms)) if len(circle_rms) else None
         ),
-        marker_circle_rms_max_mm=float(np.max(circle_rms)) if len(circle_rms) else None,
+        rms_max=float(np.max(circle_rms)) if len(circle_rms) else None,
     )
     return location, [candidate.data() for candidate in selected]
 
 
-def turntable_subject_mask(
+def subject_filter(
     points: np.ndarray,
     location: TurntableLocation,
     *,
@@ -218,7 +218,7 @@ def turntable_subject_mask(
     return keep
 
 
-def _z_window_mask(
+def _z_mask(
     points: np.ndarray,
     *,
     z_min_mm: float | None,
@@ -239,7 +239,7 @@ def _z_window_mask(
     return mask
 
 
-def _write_subject_indices(directory: Path, mask: np.ndarray) -> Path:
+def _write_indices(directory: Path, mask: np.ndarray) -> Path:
     layout = CaptureLayout(directory)
     path = layout.write_path("processed", "source_indices.npy")
     np.save(path, np.flatnonzero(mask).astype(np.int64))
@@ -253,7 +253,7 @@ def _write_subject_indices(directory: Path, mask: np.ndarray) -> Path:
     return path
 
 
-def _write_valid_z_indices(directory: Path, mask: np.ndarray) -> Path:
+def _write_valid(directory: Path, mask: np.ndarray) -> Path:
     layout = CaptureLayout(directory)
     path = layout.write_path("processed", "valid.npy")
     np.save(path, np.flatnonzero(mask).astype(np.int64))
@@ -267,14 +267,14 @@ def _write_valid_z_indices(directory: Path, mask: np.ndarray) -> Path:
     return path
 
 
-def process_turntable_capture(
+def process_capture(
     directory: str | Path,
     calibration: str | Path,
     *,
     min_height_mm: float = 1.0,
     max_height_mm: float = 80.0,
     write_source_indices: bool | None = None,
-    write_ply: bool = False,
+    save_ply: bool = False,
     z_min_mm: float | None = None,
     z_max_mm: float | None = None,
 ) -> Path:
@@ -289,13 +289,13 @@ def process_turntable_capture(
     image = load_mono8(layout.resolve("image.png"))
     calibration_payload = json.loads(Path(calibration).read_text(encoding="utf-8"))
     location, markers = locate_turntable(image, organized, calibration_payload)
-    subject_mask = turntable_subject_mask(
+    subject_mask = subject_filter(
         organized,
         location,
         min_height_mm=min_height_mm,
         max_height_mm=max_height_mm,
     )
-    z_mask = _z_window_mask(
+    z_mask = _z_mask(
         organized,
         z_min_mm=z_min_mm,
         z_max_mm=z_max_mm,
@@ -309,15 +309,15 @@ def process_turntable_capture(
     output_cloud = layout.write_path("processed", "cloud.npy")
     output_ply = layout.write_path("processed", "cloud.ply")
     np.save(output_cloud, subject)
-    if write_ply:
-        write_ascii_ply(output_ply, subject)
+    if save_ply:
+        write_ply(output_ply, subject)
     metadata_path = layout.resolve("capture.json")
     if not metadata_path.is_file():
         raise FileNotFoundError(f"采集目录缺少 metadata/capture.json: {metadata_path}")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     metadata["files"]["points_npy"] = layout.relative(points_path)
     metadata["files"]["cloud_npy"] = layout.relative(output_cloud)
-    metadata["files"]["cloud_ply"] = layout.relative(output_ply) if write_ply else None
+    metadata["files"]["cloud_ply"] = layout.relative(output_ply) if save_ply else None
     metadata["turntable"] = {**asdict(location), "markers": markers}
     metadata["subject"] = {
         "selection": "inside_marker_ring_and_above_turntable_plane",
@@ -340,13 +340,13 @@ def process_turntable_capture(
             for name in ("depth.npy", "confidence.npy", "normals.npy", "image.npy")
         )
     if write_source_indices:
-        _write_subject_indices(directory, subject_mask)
+        _write_indices(directory, subject_mask)
     if z_min_mm is not None:
-        _write_valid_z_indices(directory, z_mask)
-    return output_ply if write_ply else output_cloud
+        _write_valid(directory, z_mask)
+    return output_ply if save_ply else output_cloud
 
 
-def save_turntable_capture(
+def save_capture(
     camera: Camera,
     frame: Any,
     directory: str | Path,
@@ -364,13 +364,13 @@ def save_turntable_capture(
         raise ValueError("转台定位需要本帧 Mono8 图像")
     calibration_payload = json.loads(Path(calibration).read_text(encoding="utf-8"))
     location, markers = locate_turntable(frame.image, frame.points, calibration_payload)
-    subject_mask = turntable_subject_mask(
+    subject_mask = subject_filter(
         frame.points,
         location,
         min_height_mm=min_height_mm,
         max_height_mm=max_height_mm,
     )
-    z_mask = _z_window_mask(
+    z_mask = _z_mask(
         frame.points,
         z_min_mm=z_min_mm,
         z_max_mm=z_max_mm,
@@ -401,13 +401,13 @@ def save_turntable_capture(
         storage_policy=storage_policy,
     )
     if z_min_mm is not None:
-        _write_valid_z_indices(Path(directory), z_mask)
+        _write_valid(Path(directory), z_mask)
     if storage_policy is not None and storage_policy.save_source_indices:
-        _write_subject_indices(Path(directory), subject_mask)
+        _write_indices(Path(directory), subject_mask)
     return output
 
 
-def _fit_pinhole_intrinsics(
+def fit_intrinsics(
     organized_points: np.ndarray,
 ) -> tuple[float, float, float, float]:
     points = np.asarray(organized_points)
@@ -432,7 +432,7 @@ def _fit_pinhole_intrinsics(
     return float(fx), float(fy), float(cx), float(cy)
 
 
-def load_frame_observations(
+def load_observations(
     manifest_path: str | Path,
     calibration_path: str | Path,
     *,
@@ -452,7 +452,7 @@ def load_frame_observations(
         angle = float(record["measured_degrees"])
         transform_angle = angle_sign * angle
         alignment_rotation = rotation_matrix(calibration["axis"], transform_angle)
-        transformed = transform_about_axis(
+        transformed = rotate_axis(
             raw_points,
             origin=calibration["origin_mm"],
             axis=calibration["axis"],
@@ -467,7 +467,7 @@ def load_frame_observations(
         incidence_cosine: np.ndarray | None = None
         aligned_normals: np.ndarray | None = None
         depth_mm: np.ndarray | None = None
-        camera_origin = transform_about_axis(
+        camera_origin = rotate_axis(
             np.zeros((1, 3), dtype=np.float32),
             origin=calibration["origin_mm"],
             axis=calibration["axis"],
@@ -481,6 +481,7 @@ def load_frame_observations(
                 indices = candidate_indices[finite_mask]
                 confidence_path = capture_dir / "source" / "confidence.npy"
                 image_path = capture_dir / "source" / "image.npy"
+                image_png_path = capture_dir / "source" / "image.png"
                 normals_path = capture_dir / "source" / "normals.npy"
                 if confidence_path.is_file():
                     flat_confidence = np.asarray(np.load(confidence_path)).reshape(-1)
@@ -492,13 +493,15 @@ def load_frame_observations(
                         indices.max(initial=-1)
                     ):
                         image = source_image
+                elif image_png_path.is_file():
+                    image = load_mono8(image_png_path)
                 if normals_path.is_file():
                     source_normals = np.asarray(np.load(normals_path))
                     if source_normals.ndim >= 2 and source_normals.shape[-1] == 3:
                         flat_normals = source_normals.reshape(-1, 3)
                         if len(flat_normals) > int(indices.max(initial=-1)):
                             selected_normals = flat_normals[indices]
-                            incidence_cosine = normal_incidence_cosine(
+                            incidence_cosine = normal_cosine(
                                 raw_points[finite_mask], selected_normals
                             )
                             if len(aligned) == len(selected_normals):
@@ -513,7 +516,7 @@ def load_frame_observations(
                         np.asarray(np.load(depth_path), dtype=np.float32) * 1000.0
                     )
                 if intrinsics is None and organized_path.is_file():
-                    intrinsics = _fit_pinhole_intrinsics(
+                    intrinsics = fit_intrinsics(
                         np.load(organized_path, mmap_mode="r")
                     )
         observations.append(

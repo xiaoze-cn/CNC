@@ -15,22 +15,22 @@ from camera import (
     Camera,
     CameraConfig,
     CaptureStoragePolicy,
-    capture_options_for_profile,
+    profile_options,
 )
 from rotator import Interface, InterfaceConfig, Rotator, detect_rotator
-from inspection.markers.tracking import estimate_calibration_from_tracks
+from inspection.markers.tracking import estimate_calibration
 from inspection.metrology.deviation import (
     ComparisonResult,
     DEFAULT_TOLERANCE_MM,
-    merge_placement_scans,
+    merge_scans,
 )
 from inspection.reconstruction.fusion import (
     PointCloudProcessingConfig,
-    process_point_cloud,
-    write_processing_result,
+    process_cloud,
+    write_result,
 )
 from inspection.reconstruction.observations import (
-    process_turntable_capture,
+    process_capture,
 )
 
 from .config import ScanConfig
@@ -39,12 +39,12 @@ from .config import ScanConfig
 MIN_ADJACENT_OVERLAP_RATIO = 0.05
 
 
-def _estimate_run_calibration(
+def _estimate_calibration(
     manifest_path: Path, calibration_path: Path
 ) -> dict[str, object]:
     """Estimate the current axis from efficient all-frame marker tracking."""
 
-    return estimate_calibration_from_tracks(manifest_path, calibration_path)
+    return estimate_calibration(manifest_path, calibration_path)
 
 
 def _calibration_change(previous: dict[str, object], current: dict[str, object]) -> dict[str, float]:
@@ -62,7 +62,7 @@ def _calibration_change(previous: dict[str, object], current: dict[str, object])
     }
 
 
-def _orient_calibration_axis(
+def _orient_axis(
     previous: dict[str, object], current: dict[str, object]
 ) -> dict[str, object]:
     """Resolve the axis-line sign so height and commanded rotation stay consistent."""
@@ -72,9 +72,9 @@ def _orient_calibration_axis(
     if float(np.dot(old_axis, new_axis)) < 0:
         current = dict(current)
         current["axis"] = (-new_axis).tolist()
-        current["axis_sign_aligned_to_previous"] = True
+        current["axis_aligned"] = True
     else:
-        current["axis_sign_aligned_to_previous"] = False
+        current["axis_aligned"] = False
     return current
 
 
@@ -92,7 +92,7 @@ def _capture_turntable(
     if config.settle_seconds < 0 or config.step_degrees == 0:
         raise ValueError("step_degrees must be non-zero and settle_seconds non-negative")
     output = Path(output)
-    storage_policy = storage_policy or CaptureStoragePolicy.compact()
+    storage_policy = storage_policy or CaptureStoragePolicy.metrology()
     per_capture_artifacts = [
         "source/points.npy",
         "source/image.png",
@@ -107,7 +107,7 @@ def _capture_turntable(
         per_capture_artifacts.append("source/normals.npy")
     if storage_policy.save_image_npy:
         per_capture_artifacts.append("source/image.npy")
-    if storage_policy.save_processed_cloud_ply:
+    if storage_policy.save_ply:
         per_capture_artifacts.append("processed/cloud.ply")
     if storage_policy.save_source_indices:
         per_capture_artifacts.append("processed/source_indices.npy")
@@ -129,7 +129,15 @@ def _capture_turntable(
             "workers": 1,
             "max_pending_frames": 2,
             "per_capture_artifacts": per_capture_artifacts,
-            "profile": "complete" if storage_policy == CaptureStoragePolicy.complete() else "compact",
+            "profile": (
+                "complete"
+                if storage_policy == CaptureStoragePolicy.complete()
+                else "metrology"
+                if storage_policy == CaptureStoragePolicy.metrology()
+                else "compact"
+                if storage_policy == CaptureStoragePolicy.compact()
+                else "custom"
+            ),
         },
         "frames": [],
     }
@@ -141,7 +149,7 @@ def _capture_turntable(
         error: Exception | None = None
         try:
             with Camera(camera_config) as camera:
-                capture_options = capture_options_for_profile(
+                capture_options = profile_options(
                     camera,
                     config.capture_profile,
                     reflection_filter_threshold=config.reflection_filter_threshold,
@@ -223,13 +231,13 @@ def _write_model(
         voxel_size_mm=voxel_size,
         angle_sign=angle_sign,
     )
-    result = process_point_cloud(
+    result = process_cloud(
         manifest,
         calibration,
         config,
         prefer_gpu=prefer_gpu,
     )
-    return write_processing_result(
+    return write_result(
         result,
         output,
         report_path=metrics_output,
@@ -299,14 +307,14 @@ def build_placement(
     capture_config = manifest_payload.get("config", {})
     # 只有这个放置面全部采集完成后才进行定位并应用定位后的 Z 轴范围
     for record in manifest_payload["frames"]:
-        process_turntable_capture(
+        process_capture(
             run_dir / record["directory"],
             calibration_input,
             z_min_mm=capture_config.get("z_min_mm"),
             z_max_mm=capture_config.get("z_max_mm"),
         )
-    current = _orient_calibration_axis(
-        previous, _estimate_run_calibration(manifest, calibration_input)
+    current = _orient_axis(
+        previous, _estimate_calibration(manifest, calibration_input)
     )
     change = _calibration_change(previous, current)
     calibration_copy.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -314,7 +322,7 @@ def build_placement(
     if recalibrated:
         for record in manifest_payload["frames"]:
             capture_dir = run_dir / record["directory"]
-            process_turntable_capture(
+            process_capture(
                 capture_dir,
                 calibration_copy,
                 z_min_mm=capture_config.get("z_min_mm"),
@@ -332,7 +340,8 @@ def build_placement(
         "origin_change_mm": change["origin_mm"],
         "captures_reprocessed": recalibrated,
         "axis_residual_mm": current["axis_residual_mm"],
-        "max_frame_rms_mm": max(current["frame_rms_mm"]),
+        "max_frame_rms": max(current["frame_rms_mm"]),
+        "quality_gate": current.get("quality_gate"),
     }
     manifest.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     model_output = Path(output) if output else run_dir / "cloud.ply"
@@ -356,8 +365,8 @@ def build_placement(
     median_overlap = float(np.median(overlap_ratios)) if overlap_ratios else 0.0
     metrics["quality_gate"] = {
         "status": "pass" if median_overlap >= MIN_ADJACENT_OVERLAP_RATIO else "fail",
-        "median_adjacent_overlap_ratio": median_overlap,
-        "minimum_adjacent_overlap_ratio": MIN_ADJACENT_OVERLAP_RATIO,
+        "median_overlap": median_overlap,
+        "min_overlap": MIN_ADJACENT_OVERLAP_RATIO,
     }
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
     if median_overlap < MIN_ADJACENT_OVERLAP_RATIO:
@@ -377,12 +386,15 @@ def merge_placements(
     mesh_samples: int = 300000,
     prefer_gpu: bool = False,
     rebuild: bool = True,
+    fusion_mode: str = "nominal",
 ) -> ComparisonResult:
     """重建所有放置面并完成多面合并和 STEP 对比"""
 
     source = Path(source)
     if not source.is_dir():
         raise NotADirectoryError(f"检测目录不存在: {source}")
+    if fusion_mode not in {"nominal", "consensus"}:
+        raise ValueError("fusion_mode must be nominal or consensus")
     if step_path is None:
         state_path = source / "inspection.json"
         if not state_path.is_file():
@@ -410,18 +422,27 @@ def merge_placements(
             raise FileNotFoundError(f"放置面点云不存在: {cloud}")
         placement_clouds.append((placement_dir.name, cloud))
 
-    result = merge_placement_scans(
+    result = merge_scans(
         step_path,
         placement_clouds,
         source,
         tolerance_mm=tolerance_mm,
         voxel_size=voxel_size,
         mesh_samples=mesh_samples,
+        fusion_mode=fusion_mode,
     )
     state_path = source / "inspection.json"
     if state_path.is_file():
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["status"] = "ok"
+        processing_status = result.report.get("processing_status", "ok")
+        conformance = result.report.get(
+            "conformance", {"status": "indeterminate"}
+        )
+        state["status"] = processing_status
+        state["processing_status"] = processing_status
+        state["status_scope"] = "processing_only"
+        state["fusion_mode"] = fusion_mode
+        state["conformance"] = conformance
         state.pop("error", None)
         state["completed_at"] = datetime.now().isoformat()
         state["stages"] = [
@@ -434,7 +455,9 @@ def merge_placements(
         ] + [
             {
                 "name": "merge-and-compare",
-                "status": "ok",
+                "status": processing_status,
+                "status_scope": "processing_only",
+                "conformance": conformance,
                 "cloud": str(source / "cloud.ply"),
                 "report": str(result.output_dir / "report.json"),
             }

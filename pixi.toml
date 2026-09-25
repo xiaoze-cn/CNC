@@ -1,6 +1,6 @@
 [workspace]
 name = "pcb-cnc-inspection"
-version = "0.6.0"
+version = "0.1.1"
 description = "PCB and CNC inspection with structured-light scanning and a motorized turntable"
 authors = ["Project contributors"]
 channels = ["conda-forge"]

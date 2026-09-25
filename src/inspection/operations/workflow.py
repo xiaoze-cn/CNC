@@ -25,7 +25,7 @@ class InspectionCancelled(RuntimeError):
     """表示操作员主动取消检测"""
 
 
-def _parse_placement_command(value: str) -> tuple[str, int | None]:
+def _parse_command(value: str) -> tuple[str, int | None]:
     """解析放置面命令以及可选的采集次数"""
 
     parts = value.strip().upper().split()
@@ -81,7 +81,7 @@ def inspect_workpiece(
     step_path: str | Path,
     *,
     wait_for_placement: Callable[[], str],
-    wait_for_first_placement: Callable[[], str] | None = None,
+    wait_first: Callable[[], str] | None = None,
     camera_config: CameraConfig | None = None,
     voxel_size: float = 0.05,
     angle_sign: float = -1.0,
@@ -89,9 +89,12 @@ def inspect_workpiece(
     mesh_samples: int = 300000,
     prefer_gpu: bool = False,
     storage_policy: CaptureStoragePolicy | None = None,
+    fusion_mode: str = "nominal",
 ) -> Path:
     """交互采集任意数量放置面并完成重建合并和 STEP 对比"""
 
+    if fusion_mode not in {"nominal", "consensus"}:
+        raise ValueError("fusion_mode must be nominal or consensus")
     total_started = time.perf_counter()
     print("[inspect] 检测开始", flush=True)
     output = Path(output)
@@ -103,6 +106,7 @@ def inspect_workpiece(
         "model": str(step_path),
         "tolerance_mm": float(tolerance_mm),
         "voxel_size_mm": float(voxel_size),
+        "fusion_mode": fusion_mode,
         "placements": [],
         "stages": [],
     }
@@ -116,9 +120,9 @@ def inspect_workpiece(
     manifests: list[tuple[str, Path]] = []
     placement_config = config
     try:
-        if wait_for_first_placement is not None:
-            command, first_frames = _parse_placement_command(
-                wait_for_first_placement()
+        if wait_first is not None:
+            command, first_frames = _parse_command(
+                wait_first()
             )
             if command == "-Q":
                 raise InspectionCancelled("用户取消检测")
@@ -157,7 +161,7 @@ def inspect_workpiece(
                 }
             )
             save_state()
-            command, next_frames = _parse_placement_command(wait_for_placement())
+            command, next_frames = _parse_command(wait_for_placement())
             if command == "-F":
                 break
             if command == "-Q":
@@ -211,17 +215,27 @@ def inspect_workpiece(
                 mesh_samples=mesh_samples,
                 prefer_gpu=prefer_gpu,
                 rebuild=False,
+                fusion_mode=fusion_mode,
             ),
         )
         state["stages"].append(
             {
                 "name": "merge-and-compare",
-                "status": "ok",
+                "status": result.report.get("processing_status", "ok"),
+                "status_scope": "processing_only",
+                "conformance": result.report.get(
+                    "conformance", {"status": "indeterminate"}
+                ),
                 "cloud": str(output / "cloud.ply"),
                 "report": str(result.output_dir / "report.json"),
             }
         )
-        state["status"] = "ok"
+        state["status"] = result.report.get("processing_status", "ok")
+        state["processing_status"] = state["status"]
+        state["status_scope"] = "processing_only"
+        state["conformance"] = result.report.get(
+            "conformance", {"status": "indeterminate"}
+        )
         state["completed_at"] = datetime.now().isoformat()
         save_state()
         elapsed = time.perf_counter() - total_started

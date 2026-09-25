@@ -18,7 +18,7 @@ class SpatialComponentSelection:
     retained_component_count: int
 
 
-def classify_spatial_components(
+def classify_components(
     points: np.ndarray,
     *,
     radius_mm: float,
@@ -55,12 +55,12 @@ def classify_spatial_components(
     )
 
 
-def apply_spatial_component_evidence(
+def apply_evidence(
     valid_points: np.ndarray,
     uncertain_points: np.ndarray,
     config: Any,
 ) -> tuple[np.ndarray, np.ndarray, SpatialComponentSelection]:
-    selection = classify_spatial_components(
+    selection = classify_components(
         valid_points,
         radius_mm=config.component_radius_mm,
         min_component_ratio=config.min_component_ratio,

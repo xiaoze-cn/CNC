@@ -24,7 +24,7 @@ class MarkerCandidate:
     component_area_px: int | None = None
     center_method: str | None = None
     component_point_count: int | None = None
-    circle_boundary_point_count: int | None = None
+    boundary_count: int | None = None
     circle_inlier_count: int | None = None
     circle_radius_mm: float | None = None
     circle_rms_mm: float | None = None
@@ -40,7 +40,7 @@ def load_mono8(path: str | Path) -> np.ndarray:
     return image
 
 
-def detect_marker_components(
+def detect_markers(
     image: np.ndarray,
     *,
     roi: tuple[int, int, int, int] | None = None,
@@ -111,7 +111,7 @@ def detect_marker_components(
     return sorted(candidates, key=lambda candidate: (candidate.y_px, candidate.x_px))
 
 
-def attach_pointcloud_coordinates(
+def attach_points(
     candidates: Iterable[MarkerCandidate],
     points: np.ndarray,
     *,
@@ -154,7 +154,7 @@ def _plane_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray
     return normal, u, v
 
 
-def _circle_from_three(points: np.ndarray) -> tuple[np.ndarray, float] | None:
+def _seed_circle(points: np.ndarray) -> tuple[np.ndarray, float] | None:
     a, b, c = np.asarray(points, dtype=np.float64).reshape(3, 2)
     matrix = 2.0 * np.asarray([b - a, c - a])
     determinant = float(np.linalg.det(matrix))
@@ -165,7 +165,7 @@ def _circle_from_three(points: np.ndarray) -> tuple[np.ndarray, float] | None:
     return center, float(np.linalg.norm(a - center))
 
 
-def _least_squares_circle(points: np.ndarray) -> tuple[np.ndarray, float]:
+def _fit_circle(points: np.ndarray) -> tuple[np.ndarray, float]:
     points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
     anchor = np.mean(points, axis=0)
     local = points - anchor
@@ -178,7 +178,7 @@ def _least_squares_circle(points: np.ndarray) -> tuple[np.ndarray, float]:
     return solution[:2] + anchor, float(np.sqrt(radius_squared))
 
 
-def _robust_circle_fit(
+def _robust_circle(
     points: np.ndarray,
     *,
     residual_threshold_mm: float = 0.20,
@@ -195,7 +195,7 @@ def _robust_circle_fit(
     for sample in rng.choice(len(points), size=(iterations, 3), replace=True):
         if len(set(int(index) for index in sample)) < 3:
             continue
-        circle = _circle_from_three(points[sample])
+        circle = _seed_circle(points[sample])
         if circle is None:
             continue
         center, radius = circle
@@ -215,20 +215,20 @@ def _robust_circle_fit(
     if best_inliers is None:
         return None
 
-    center, radius = _least_squares_circle(points[best_inliers])
+    center, radius = _fit_circle(points[best_inliers])
     for _ in range(3):
         residuals = np.abs(np.linalg.norm(points - center, axis=1) - radius)
         refined = residuals <= residual_threshold_mm
         if np.count_nonzero(refined) < 12 or np.array_equal(refined, best_inliers):
             break
         best_inliers = refined
-        center, radius = _least_squares_circle(points[best_inliers])
+        center, radius = _fit_circle(points[best_inliers])
     residuals = np.abs(np.linalg.norm(points - center, axis=1) - radius)
     rms = float(np.sqrt(np.mean(residuals[best_inliers] ** 2)))
     return center, radius, best_inliers, rms
 
 
-def attach_marker_component_coordinates(
+def attach_coordinates(
     candidates: Iterable[MarkerCandidate],
     image: np.ndarray,
     points: np.ndarray,
@@ -238,7 +238,7 @@ def attach_marker_component_coordinates(
     threshold: float = 20.0,
     blur_kernel: int = 5,
     residual_threshold_mm: float = 0.20,
-    max_circle_rms_mm: float = 0.18,
+    max_rms: float = 0.18,
     min_inlier_ratio: float = 0.55,
 ) -> list[MarkerCandidate]:
     """Recover marker centers by fitting their full 3D component boundaries.
@@ -264,7 +264,7 @@ def attach_marker_component_coordinates(
     normal, u, v = _plane_basis(normal)
 
     candidate_list = list(candidates)
-    fallback = attach_pointcloud_coordinates(
+    fallback = attach_points(
         candidate_list,
         organized,
         image_shape=image.shape,
@@ -299,7 +299,7 @@ def attach_marker_component_coordinates(
                 replace(
                     fallback_candidate,
                     component_point_count=len(component_xyz),
-                    circle_boundary_point_count=len(boundary_xyz),
+                    boundary_count=len(boundary_xyz),
                 )
             )
             continue
@@ -315,7 +315,7 @@ def attach_marker_component_coordinates(
                 replace(
                     fallback_candidate,
                     component_point_count=len(component_xyz),
-                    circle_boundary_point_count=len(boundary_xyz),
+                    boundary_count=len(boundary_xyz),
                 )
             )
             continue
@@ -324,7 +324,7 @@ def attach_marker_component_coordinates(
         boundary_2d = np.column_stack(
             ((boundary_xyz - anchor) @ u, (boundary_xyz - anchor) @ v)
         )
-        fit = _robust_circle_fit(
+        fit = _robust_circle(
             boundary_2d,
             residual_threshold_mm=residual_threshold_mm,
         )
@@ -333,7 +333,7 @@ def attach_marker_component_coordinates(
                 replace(
                     fallback_candidate,
                     component_point_count=len(component_xyz),
-                    circle_boundary_point_count=len(boundary_xyz),
+                    boundary_count=len(boundary_xyz),
                 )
             )
             continue
@@ -343,14 +343,14 @@ def attach_marker_component_coordinates(
             inlier_count >= 12
             and inlier_count / len(boundary_xyz) >= min_inlier_ratio
             and 0.5 <= radius <= 20.0
-            and rms <= max_circle_rms_mm
+            and rms <= max_rms
         )
         if not accepted:
             result.append(
                 replace(
                     fallback_candidate,
                     component_point_count=len(component_xyz),
-                    circle_boundary_point_count=len(boundary_xyz),
+                    boundary_count=len(boundary_xyz),
                     circle_inlier_count=inlier_count,
                     circle_radius_mm=float(radius),
                     circle_rms_mm=rms,
@@ -369,7 +369,7 @@ def attach_marker_component_coordinates(
                 point_mm=tuple(float(value) for value in center_3d),
                 center_method="component-boundary-circle-fit",
                 component_point_count=len(component_xyz),
-                circle_boundary_point_count=len(boundary_xyz),
+                boundary_count=len(boundary_xyz),
                 circle_inlier_count=inlier_count,
                 circle_radius_mm=float(radius),
                 circle_rms_mm=rms,
