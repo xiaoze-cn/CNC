@@ -1,0 +1,7 @@
+.pixi/
+*.py[cod]
+__pycache__/
+
+
+3D Model/
+data/inspect/
